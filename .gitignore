@@ -1,0 +1,22 @@
+# Python artifacts
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Local configuration contains the Jellyfin API key
+shim.json
+
+# Runtime/debug output
+*.log
+
+# makepkg output
+pkg/
+src/
+*.pkg.tar.*
+
+# Editor and OS metadata
+.idea/
+.vscode/
+*~
+.DS_Store

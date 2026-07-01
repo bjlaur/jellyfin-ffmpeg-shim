@@ -1,0 +1,1018 @@
+#!/usr/bin/env python3
+
+# =============================================================================
+# Jellyfin FFmpeg shim
+# =============================================================================
+#
+# Mode flags:
+#
+#   KILL_SWITCH = 1
+#       Total passthrough. No bitrate rewrite, HDR rewrite, or API decision.
+#
+#   ENABLE_HDR_TO_HDR = 1
+#       Rewrite Jellyfin software HDR->SDR tonemapx commands into HDR->HDR.
+#
+#   ENABLE_BITRATE_MIN = 1
+#       If Jellyfin passes -maxrate X, add/update -minrate to MINRATE_RATIO * X.
+#
+#   ENABLE_FILTER_COMPLEX_HDR_TO_HDR = 0
+#       v1 does NOT rewrite filter_complex / subtitle burn-in graphs.
+#       Keep this 0 until we intentionally implement that path.
+#
+#   LOG_FULL_ARGV = 1
+#       Log original and rewritten full FFmpeg argv.
+#
+# =============================================================================
+
+import os
+import sys
+import shlex
+import re
+import json
+import time
+import urllib.request
+from datetime import datetime
+
+
+CONFIG_FILE = os.environ.get("JELLYFIN_SHIM_CONFIG", "/etc/jellyfin/shim.json")
+CONFIG_LOAD_ERROR = None
+
+# Fail-safe state used only until JSON configuration loads. The FFmpeg path is
+# the single intentional deployment fallback so invalid configuration can still
+# provide total passthrough.
+EMERGENCY_REAL_FFMPEG = "/usr/lib/jellyfin-ffmpeg/ffmpeg"
+KILL_SWITCH = True
+REAL_FFMPEG = EMERGENCY_REAL_FFMPEG
+LOG_FILE = None
+ENABLE_HDR_TO_HDR = False
+ENABLE_BITRATE_MIN = False
+ENABLE_BLOCKING_CLIENT_DECISION = False
+ENABLE_FILTER_COMPLEX_HDR_TO_HDR = False
+LOG_FULL_ARGV = False
+MINRATE_RATIO = None
+JELLYFIN_URL = None
+JELLYFIN_API_KEY = ""
+BLOCKING_DECISION_POLL_DELAYS_SECONDS = None
+BLOCKING_DECISION_API_TIMEOUT_SECONDS = None
+HDR_ALLOW_LIST = []
+HDR_DENY_LIST = []
+
+
+def _config_bool(section, key):
+    value = section[key]
+    if not isinstance(value, bool):
+        raise ValueError(f"{key} must be true or false")
+    return value
+
+
+def _config_number(section, key, *, minimum=0.0, maximum=None):
+    value = section[key]
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError(f"{key} must be a number")
+    value = float(value)
+    if value < minimum or (maximum is not None and value > maximum):
+        raise ValueError(f"{key} is outside the allowed range")
+    return value
+
+
+def _config_number_list(section, key):
+    value = section[key]
+    if (
+        not isinstance(value, list)
+        or not value
+        or any(isinstance(item, bool) or not isinstance(item, (int, float)) for item in value)
+    ):
+        raise ValueError(f"{key} must be a non-empty array of numbers")
+    result = [float(item) for item in value]
+    if any(item < 0 for item in result) or result != sorted(result):
+        raise ValueError(f"{key} must contain ascending non-negative values")
+    return result
+
+
+def _config_rules(value, key):
+    if not isinstance(value, list):
+        raise ValueError(f"{key} must be an array")
+    rules = []
+    for index, rule in enumerate(value):
+        if not isinstance(rule, dict) or not isinstance(rule.get("username"), str):
+            raise ValueError(f"{key}[{index}] must contain a string username")
+        devices = rule.get("devices")
+        if devices is not None and (
+            not isinstance(devices, list)
+            or not all(isinstance(device, str) for device in devices)
+        ):
+            raise ValueError(f"{key}[{index}].devices must be an array of strings")
+        rules.append({
+            "username": rule["username"],
+            **({"devices": devices} if devices is not None else {}),
+        })
+    return rules
+
+
+def load_config(path: str = CONFIG_FILE) -> None:
+    global KILL_SWITCH, ENABLE_HDR_TO_HDR, ENABLE_BITRATE_MIN
+    global ENABLE_BLOCKING_CLIENT_DECISION
+    global ENABLE_FILTER_COMPLEX_HDR_TO_HDR, LOG_FULL_ARGV
+    global JELLYFIN_URL, JELLYFIN_API_KEY
+    global REAL_FFMPEG, LOG_FILE
+    global MINRATE_RATIO, BLOCKING_DECISION_POLL_DELAYS_SECONDS
+    global BLOCKING_DECISION_API_TIMEOUT_SECONDS
+    global HDR_ALLOW_LIST, HDR_DENY_LIST
+    global CONFIG_LOAD_ERROR
+
+    if not os.path.exists(path):
+        KILL_SWITCH = 1
+        CONFIG_LOAD_ERROR = f"config file missing: {path}"
+        return
+
+    try:
+        with open(path, "r", encoding="utf-8") as config_file:
+            config = json.load(config_file)
+        if not isinstance(config, dict):
+            raise ValueError("top-level config must be an object")
+
+        shim = config["shim"]
+        jellyfin = config["jellyfin"]
+        paths = config["paths"]
+        tuning = config["tuning"]
+        hdr_access = config["hdr_access"]
+        if not all(
+            isinstance(section, dict) for section in (shim, jellyfin, paths, tuning, hdr_access)
+        ):
+            raise ValueError("shim, jellyfin, paths, tuning, and hdr_access must be objects")
+
+        KILL_SWITCH = _config_bool(shim, "kill_switch")
+        ENABLE_HDR_TO_HDR = _config_bool(shim, "enable_hdr_to_hdr")
+        ENABLE_BITRATE_MIN = _config_bool(shim, "enable_bitrate_min")
+        ENABLE_BLOCKING_CLIENT_DECISION = _config_bool(
+            shim, "enable_blocking_client_decision"
+        )
+        ENABLE_FILTER_COMPLEX_HDR_TO_HDR = _config_bool(
+            shim, "enable_filter_complex_hdr_to_hdr"
+        )
+        LOG_FULL_ARGV = _config_bool(shim, "log_full_argv")
+
+        JELLYFIN_URL = jellyfin["url"]
+        JELLYFIN_API_KEY = jellyfin["api_key"]
+        if not isinstance(JELLYFIN_URL, str) or not isinstance(JELLYFIN_API_KEY, str):
+            raise ValueError("jellyfin.url and jellyfin.api_key must be strings")
+        JELLYFIN_URL = JELLYFIN_URL.strip()
+        JELLYFIN_API_KEY = JELLYFIN_API_KEY.strip()
+
+        REAL_FFMPEG = paths["ffmpeg_binary"]
+        LOG_FILE = paths["log_file"]
+        if not all(
+            isinstance(value, str) and value.strip()
+            for value in (REAL_FFMPEG, LOG_FILE)
+        ):
+            raise ValueError("all configured paths must be non-empty strings")
+        REAL_FFMPEG = REAL_FFMPEG.strip()
+        LOG_FILE = LOG_FILE.strip()
+
+        MINRATE_RATIO = _config_number(
+            tuning, "minrate_ratio", minimum=0.0, maximum=1.0
+        )
+        BLOCKING_DECISION_POLL_DELAYS_SECONDS = _config_number_list(
+            tuning, "blocking_decision_poll_delays_seconds"
+        )
+        BLOCKING_DECISION_API_TIMEOUT_SECONDS = _config_number(
+            tuning, "blocking_decision_api_timeout_seconds",
+            minimum=0.01,
+        )
+        if not JELLYFIN_API_KEY or JELLYFIN_API_KEY == "PASTE_YOUR_API_KEY_HERE":
+            KILL_SWITCH = 1
+            CONFIG_LOAD_ERROR = "API key missing; forced KILL_SWITCH=1"
+            return
+
+        HDR_ALLOW_LIST = _config_rules(hdr_access["allow_list"], "allow_list")
+        HDR_DENY_LIST = _config_rules(hdr_access["deny_list"], "deny_list")
+        CONFIG_LOAD_ERROR = None
+    except Exception as error:
+        # Invalid configuration must result in total passthrough.
+        KILL_SWITCH = 1
+        REAL_FFMPEG = EMERGENCY_REAL_FFMPEG
+        JELLYFIN_API_KEY = ""
+        CONFIG_LOAD_ERROR = (
+            f"invalid config; forced KILL_SWITCH=1: {type(error).__name__}: {error}"
+        )
+
+
+load_config()
+
+
+HDR_TO_SDR_MARKERS = [
+    "tonemapx=tonemap=bt2390",
+    "t=bt709",
+    "m=bt709",
+    "p=bt709",
+    "format=yuv420p",
+]
+
+HDR_TO_HDR_FILTER = "format=yuv420p10le"
+
+# Preserve HDR in P010 VAAPI surfaces without tone mapping before mapping the
+# frames into the QSV device.
+HDR_VAAPI_FILTER = (
+    "scale_vaapi=format=p010:out_color_matrix=bt2020nc:"
+    "out_color_primaries=bt2020:out_color_transfer=smpte2084:out_range=limited"
+)
+
+HDR_X265_PARAMS = {
+    "repeat-headers": "1",
+    "hdr10": "1",
+    "colorprim": "bt2020",
+    "transfer": "smpte2084",
+    "colormatrix": "bt2020nc",
+}
+
+
+def log(msg: str = "") -> None:
+    try:
+        with open(LOG_FILE, "a", encoding="utf-8") as f:
+            f.write(msg)
+            if not msg.endswith("\n"):
+                f.write("\n")
+    except Exception:
+        # Logging must never break playback.
+        pass
+
+
+def shell_join(argv):
+    return " ".join(shlex.quote(x) for x in argv)
+
+
+def has_option(argv, option_names):
+    return any(arg in option_names for arg in argv)
+
+
+def get_option_value(argv, option_names):
+    for i, arg in enumerate(argv[:-1]):
+        if arg in option_names:
+            return argv[i + 1]
+    return None
+
+
+def normalize_file_arg(value: str) -> str:
+    if value.startswith("file:"):
+        value = value[5:]
+    return value
+
+
+def parse_ffmpeg_argv_for_decision(argv):
+    inputs = []
+    output_paths = []
+    hls_stems = []
+
+    i = 0
+    while i < len(argv):
+        arg = argv[i]
+        if arg == "-i" and i + 1 < len(argv):
+            inputs.append(normalize_file_arg(argv[i + 1]))
+            i += 2
+            continue
+        if arg == "-hls_segment_filename" and i + 1 < len(argv):
+            segment_name = os.path.basename(argv[i + 1])
+            stem = segment_name.replace("%d", "")
+            if stem:
+                hls_stems.append(stem)
+            i += 2
+            continue
+        i += 1
+
+    if argv and not argv[-1].startswith("-"):
+        output_paths.append(normalize_file_arg(argv[-1]))
+
+    return {
+        "inputs": inputs,
+        "input_basenames": [os.path.basename(x) for x in inputs if x],
+        "output_paths": output_paths,
+        "output_basenames": [os.path.basename(x) for x in output_paths if x],
+        "hls_stems": hls_stems,
+    }
+
+
+def api_get_sessions():
+    # Do not use ActiveWithinSeconds here. Jellyfin may not update the initiating
+    # session's activity timestamp before spawning FFmpeg, which can hide the very
+    # session this blocking decision needs to inspect.
+    url = JELLYFIN_URL.rstrip("/") + "/Sessions"
+    request = urllib.request.Request(
+        url,
+        headers={
+            "X-Emby-Token": JELLYFIN_API_KEY,
+            "Accept": "application/json",
+        },
+    )
+    with urllib.request.urlopen(
+        request, timeout=BLOCKING_DECISION_API_TIMEOUT_SECONDS
+    ) as response:
+        data = json.loads(response.read().decode("utf-8"))
+    if not isinstance(data, list):
+        raise ValueError("/Sessions response was not a JSON array")
+    return data
+
+
+def score_session_for_decision(session, parsed):
+    score = 0
+    reasons = []
+    session_text = json.dumps(session, ensure_ascii=False, sort_keys=True).lower()
+    now_playing = session.get("NowPlayingItem") or {}
+    has_transcoding_info = bool(session.get("TranscodingInfo"))
+
+    if has_transcoding_info:
+        score += 20
+        reasons.append("has TranscodingInfo")
+    if now_playing:
+        score += 10
+        reasons.append("has NowPlayingItem")
+
+    for path in parsed["inputs"]:
+        if path and path.lower() in session_text:
+            score += 100
+            reasons.append("matched full input path")
+    for basename in parsed["input_basenames"]:
+        if basename and basename.lower() in session_text:
+            score += 50
+            reasons.append("matched input basename")
+    for basename in parsed["output_basenames"]:
+        if basename and basename.lower() in session_text:
+            score += 25
+            reasons.append("matched output basename")
+    for stem in parsed["hls_stems"]:
+        if stem and stem.lower() in session_text:
+            score += 25
+            reasons.append("matched HLS output stem")
+
+    return {
+        "score": score,
+        "reasons": reasons,
+        "has_transcoding_info": has_transcoding_info,
+        "user_name": session.get("UserName"),
+        "device_name": session.get("DeviceName"),
+        "device_id": session.get("DeviceId"),
+        "client": session.get("Client"),
+        "now_playing_path": now_playing.get("Path"),
+    }
+
+
+def decide_session_candidate(scored):
+    if not scored:
+        return None, "low", "no active sessions"
+
+    ordered = sorted(scored, key=lambda item: item["score"], reverse=True)
+    best = ordered[0]
+    tied_best = [item for item in ordered if item["score"] == best["score"]]
+
+    if best["score"] >= 100 and len(tied_best) == 1:
+        return best, "high", "unique path-based match"
+
+    transcodes = [item for item in ordered if item["has_transcoding_info"]]
+    if len(transcodes) == 1:
+        return transcodes[0], "medium", "exactly one active transcoding session"
+    if len(transcodes) > 1:
+        return None, "low", "multiple ambiguous transcoding sessions"
+    return None, "low", "no active transcoding session"
+
+
+def apply_client_allowlist(candidate):
+    user_name = candidate.get("user_name")
+    device_name = candidate.get("device_name")
+
+    normalized_user = user_name.casefold() if isinstance(user_name, str) else ""
+    normalized_device = device_name.casefold() if isinstance(device_name, str) else ""
+
+    def matches(rule):
+        if rule["username"].casefold() != normalized_user:
+            return False
+        devices = rule.get("devices")
+        if devices is None:
+            return True
+        return normalized_device in {device.casefold() for device in devices}
+
+    if any(matches(rule) for rule in HDR_DENY_LIST):
+        return False, "matched deny rule"
+    if any(matches(rule) for rule in HDR_ALLOW_LIST):
+        return True, "matched allow rule"
+    return False, "no matching allow rule"
+
+
+def blocking_client_decision(argv, report):
+    decision = {
+        "allow_hdr_to_hdr": False,
+        "reason": "blocking decision did not run",
+        "confidence": "low",
+        "session": None,
+    }
+
+    if ENABLE_BLOCKING_CLIENT_DECISION != 1:
+        decision["reason"] = "ENABLE_BLOCKING_CLIENT_DECISION=0"
+        report["blocking_client_decision"].append("DISABLED: ENABLE_BLOCKING_CLIENT_DECISION=0")
+        return decision
+    if not JELLYFIN_API_KEY or JELLYFIN_API_KEY == "PASTE_YOUR_API_KEY_HERE":
+        decision["reason"] = "API key missing"
+        report["blocking_client_decision"].append("BAIL: API key missing")
+        return decision
+
+    parsed = parse_ffmpeg_argv_for_decision(argv)
+    previous_delay = 0.0
+    last_reason = "no poll completed"
+
+    for delay in BLOCKING_DECISION_POLL_DELAYS_SECONDS:
+        sleep_for = max(0.0, delay - previous_delay)
+        previous_delay = delay
+        if sleep_for:
+            time.sleep(sleep_for)
+
+        try:
+            sessions = api_get_sessions()
+            scored = [score_session_for_decision(s, parsed) for s in sessions]
+            candidate, confidence, candidate_reason = decide_session_candidate(scored)
+            best = max(scored, key=lambda item: item["score"], default=None)
+            report["blocking_client_decision"].append(
+                "POLL: "
+                f"delay={delay} session_count={len(sessions)} "
+                f"best_score={best.get('score') if best else None} "
+                f"user={best.get('user_name') if best else None!r} "
+                f"device={best.get('device_name') if best else None!r} "
+                f"client={best.get('client') if best else None!r}"
+            )
+            last_reason = candidate_reason
+
+            if candidate is not None:
+                allow, allow_reason = apply_client_allowlist(candidate)
+                decision.update({
+                    "allow_hdr_to_hdr": allow,
+                    "reason": allow_reason,
+                    "confidence": confidence,
+                    "session": candidate,
+                })
+                report["blocking_client_decision"].append(
+                    f"DECISION: {'ALLOW' if allow else 'DENY'} "
+                    f"confidence={confidence} user={candidate['user_name']!r} "
+                    f"device={candidate['device_name']!r} reason={allow_reason!r}"
+                )
+                return decision
+        except Exception as error:
+            last_reason = f"Jellyfin API error: {type(error).__name__}: {error}"
+            report["blocking_client_decision"].append(
+                f"POLL_ERROR: delay={delay} error={type(error).__name__}: {error}"
+            )
+
+    decision["reason"] = last_reason
+    report["blocking_client_decision"].append(f"DECISION: DENY reason={last_reason!r}")
+    return decision
+
+
+def parse_bitrate_to_bits(value: str):
+    value = value.strip().lower()
+    multiplier = 1
+
+    if value.endswith("k"):
+        multiplier = 1_000
+        value = value[:-1]
+    elif value.endswith("m"):
+        multiplier = 1_000_000
+        value = value[:-1]
+    elif value.endswith("g"):
+        multiplier = 1_000_000_000
+        value = value[:-1]
+
+    try:
+        return int(float(value) * multiplier)
+    except ValueError:
+        return None
+
+
+def apply_minrate_from_maxrate(argv):
+    """
+    Global rewrite:
+      -maxrate X      -> -minrate 70%X -maxrate X
+      -maxrate:v:0 X  -> -minrate:v:0 70%X -maxrate:v:0 X
+    """
+    out = argv[:]
+    changes = []
+    targets = []
+
+    for i, arg in enumerate(argv[:-1]):
+        if arg == "-maxrate" or arg.startswith("-maxrate:"):
+            maxrate_value = argv[i + 1]
+            maxrate_bits = parse_bitrate_to_bits(maxrate_value)
+
+            if maxrate_bits is None:
+                changes.append(f"BAIL: could not parse {arg} {maxrate_value!r}")
+                continue
+
+            minrate_bits = int(maxrate_bits * MINRATE_RATIO)
+            suffix = arg[len("-maxrate"):]
+            minrate_opt = "-minrate" + suffix
+
+            targets.append((arg, minrate_opt, str(minrate_bits), maxrate_value))
+
+    # Deduplicate by minrate option, keeping the last matching target.
+    deduped = {}
+    for max_opt, min_opt, min_value, max_value in targets:
+        deduped[min_opt] = (max_opt, min_value, max_value)
+
+    for min_opt, (max_opt, min_value, max_value) in deduped.items():
+        existing_index = None
+
+        for j in range(len(out) - 1):
+            if out[j] == min_opt:
+                existing_index = j
+                break
+
+        if existing_index is not None:
+            old = out[existing_index + 1]
+            out[existing_index + 1] = min_value
+            changes.append(f"UPDATED: {min_opt} {old} -> {min_value}")
+            continue
+
+        insert_index = None
+
+        for j in range(len(out) - 1):
+            if out[j] == max_opt and out[j + 1] == max_value:
+                insert_index = j
+                break
+
+        if insert_index is None:
+            for j in range(len(out) - 1):
+                if out[j] == max_opt:
+                    insert_index = j
+                    break
+
+        if insert_index is not None:
+            out[insert_index:insert_index] = [min_opt, min_value]
+            changes.append(f"ADDED: {min_opt} {min_value} from {max_opt} {max_value}")
+
+    return out, changes
+
+
+def is_hdr_to_sdr_filter(value: str) -> bool:
+    return all(marker in value for marker in HDR_TO_SDR_MARKERS)
+
+
+def filter_contains_hdr_to_sdr_tonemap(value: str | None) -> bool:
+    if not value:
+        return False
+    return is_hdr_to_sdr_filter(value)
+
+
+def replace_tonemapx_with_hdr_to_hdr(value: str) -> tuple[str, str]:
+    pattern = (
+        r"tonemapx=tonemap=bt2390"
+        r"(?::[^,;\[\]]*)?"
+        r":t=bt709:m=bt709:p=bt709:format=yuv420p"
+    )
+
+    new_value, count = re.subn(pattern, HDR_TO_HDR_FILTER, value)
+
+    if count > 0:
+        return new_value, f"regex replacement count={count}"
+
+    # Fallback for slightly different ordering/extra args after detection.
+    start = value.find("tonemapx=tonemap=bt2390")
+    if start == -1:
+        return value, "BAIL: start marker not found during replacement"
+
+    end_candidates = []
+    for sep in [",", ";", "["]:
+        idx = value.find(sep, start)
+        if idx != -1:
+            end_candidates.append(idx)
+
+    end = min(end_candidates) if end_candidates else len(value)
+    new_value = value[:start] + HDR_TO_HDR_FILTER + value[end:]
+
+    return new_value, "fallback replacement used"
+
+
+def replace_vaapi_tonemap_with_hdr(value: str) -> tuple[str, str]:
+    parts = value.split(",")
+    rewritten = []
+    removed_procamp = 0
+    replaced_tonemap = 0
+
+    for part in parts:
+        name = part.strip()
+        if name.startswith("procamp_vaapi="):
+            removed_procamp += 1
+            continue
+        if name.startswith("tonemap_vaapi="):
+            rewritten.append(HDR_VAAPI_FILTER)
+            replaced_tonemap += 1
+            continue
+        rewritten.append(part)
+
+    if replaced_tonemap != 1:
+        return value, f"BAIL: expected one tonemap_vaapi filter, found {replaced_tonemap}"
+
+    return ",".join(rewritten), (
+        f"removed SDR tonemap_vaapi and inserted HDR-preserving scale_vaapi count={replaced_tonemap}; "
+        f"removed procamp_vaapi count={removed_procamp}"
+    )
+
+
+def set_or_add_option(argv, option_names, value, insert_before_last=True):
+    out = []
+    changed = False
+    actions = []
+    i = 0
+
+    while i < len(argv):
+        out.append(argv[i])
+
+        if argv[i] in option_names and i + 1 < len(argv):
+            old = argv[i + 1]
+            out.append(value)
+            actions.append(f"UPDATED: {argv[i]} {old} -> {value}")
+            i += 2
+            changed = True
+            continue
+
+        i += 1
+
+    if not changed and insert_before_last and len(out) >= 1:
+        out = out[:-1] + [option_names[0], value] + out[-1:]
+        actions.append(f"ADDED: {option_names[0]} {value}")
+
+    return out, actions
+
+
+def rewrite_x265_params(params: str) -> tuple[str, list[str]]:
+    parts = [p for p in params.split(":") if p]
+    kept = []
+    actions = []
+
+    replace_keys = set(HDR_X265_PARAMS.keys())
+
+    for p in parts:
+        key = p.split("=", 1)[0]
+        if key not in replace_keys:
+            kept.append(p)
+        else:
+            actions.append(f"REMOVED existing x265 param: {p}")
+
+    for k, v in HDR_X265_PARAMS.items():
+        kept.append(f"{k}={v}")
+        actions.append(f"ADDED x265 param: {k}={v}")
+
+    return ":".join(kept), actions
+
+
+def classify_command(argv):
+    joined = "\n".join(argv)
+
+    vf = get_option_value(argv, {"-vf", "-filter:v", "-filter:v:0", "-filter_complex:v"})
+    filter_complex = get_option_value(argv, {"-filter_complex"})
+
+    has_hdr_to_sdr_vf = filter_contains_hdr_to_sdr_tonemap(vf)
+    has_hdr_to_sdr_filter_complex = filter_contains_hdr_to_sdr_tonemap(filter_complex)
+    has_vaapi_hdr_to_sdr_vf = bool(
+        vf
+        and "tonemap_vaapi=" in vf
+        and "p=bt709" in vf
+        and "t=bt709" in vf
+        and "m=bt709" in vf
+    )
+
+    video_encoder = get_option_value(argv, {"-codec:v:0", "-c:v:0", "-codec:v", "-c:v"})
+
+    is_hw_pipeline = any(x in joined for x in [
+        "hevc_qsv",
+        "tonemap_vaapi",
+        "procamp_vaapi",
+        "hwmap=derive_device=qsv",
+        "format=qsv",
+    ])
+
+    is_supported_vaapi_qsv_pipeline = bool(
+        video_encoder == "hevc_qsv"
+        and has_vaapi_hdr_to_sdr_vf
+        and vf
+        and "hwmap=derive_device=qsv" in vf
+        and "format=qsv" in vf
+        and "-hwaccel_output_format\nvaapi" in joined
+    )
+
+    return {
+        "video_encoder": video_encoder,
+        "has_filter_complex": filter_complex is not None,
+        "has_hdr_to_sdr_vf": has_hdr_to_sdr_vf,
+        "has_hdr_to_sdr_filter_complex": has_hdr_to_sdr_filter_complex,
+        "has_vaapi_hdr_to_sdr_vf": has_vaapi_hdr_to_sdr_vf,
+        "is_hw_pipeline": is_hw_pipeline,
+        "is_supported_vaapi_qsv_pipeline": is_supported_vaapi_qsv_pipeline,
+    }
+
+
+def rewrite_vaapi_qsv_hdr_to_hdr(argv, report):
+    out = argv[:]
+    changed_filter = False
+
+    for index in range(len(out) - 1):
+        if out[index] in {"-vf", "-filter:v", "-filter:v:0"}:
+            rewritten_filter, message = replace_vaapi_tonemap_with_hdr(out[index + 1])
+            if rewritten_filter == out[index + 1]:
+                report["hdr_to_hdr"].append(f"BAIL: hardware filter rewrite failed: {message}")
+                return argv
+            out[index + 1] = rewritten_filter
+            report["hdr_to_hdr"].append(f"HARDWARE_FILTER_REWRITE: {message}")
+            changed_filter = True
+            break
+
+    if not changed_filter:
+        report["hdr_to_hdr"].append("BAIL: VAAPI/QSV filter was not found during rewrite")
+        return argv
+
+    out, actions = set_or_add_option(out, ["-profile:v:0", "-profile:v"], "main10")
+    report["hdr_to_hdr"].extend(actions)
+
+    for option, value in [
+        ("-color_primaries", "bt2020"),
+        ("-color_trc", "smpte2084"),
+        ("-colorspace", "bt2020nc"),
+        ("-color_range", "tv"),
+    ]:
+        out, actions = set_or_add_option(out, [option], value)
+        report["hdr_to_hdr"].extend(actions)
+
+    report["hdr_to_hdr"].append("SUCCESS: HDR_TO_HDR_REWRITE_APPLIED (VAAPI/QSV)")
+    return out
+
+
+def rewrite_hdr_to_hdr(argv, report, client_decision):
+    """
+    Rewrite Jellyfin software HDR->SDR tonemapx command into HDR->HDR.
+    Returns rewritten argv.
+    """
+    if ENABLE_HDR_TO_HDR != 1:
+        report["hdr_to_hdr"].append("DISABLED: ENABLE_HDR_TO_HDR=0")
+        return argv
+
+    info = classify_command(argv)
+
+    report["hdr_to_hdr"].append("ENABLED: ENABLE_HDR_TO_HDR=1")
+    report["hdr_to_hdr"].append(f"COMMAND_CLASSIFICATION: {info}")
+
+    if info["is_supported_vaapi_qsv_pipeline"]:
+        if info["has_filter_complex"]:
+            report["hdr_to_hdr"].append(
+                "BAIL: VAAPI/QSV HDR rewrite does not support -filter_complex"
+            )
+            return argv
+        if not client_decision.get("allow_hdr_to_hdr"):
+            report["hdr_to_hdr"].append(
+                "BAIL: blocking client decision did not allow HDR->HDR: "
+                + client_decision.get("reason", "unknown reason")
+            )
+            return argv
+        return rewrite_vaapi_qsv_hdr_to_hdr(argv, report)
+
+    if info["is_hw_pipeline"]:
+        report["hdr_to_hdr"].append("BAIL: hardware pipeline detected; v1 only handles software libx265 tonemapx")
+        return argv
+
+    if info["video_encoder"] != "libx265":
+        report["hdr_to_hdr"].append(
+            f"BAIL: video encoder is {info['video_encoder']!r}; v1 only handles libx265"
+        )
+        return argv
+
+    if info["has_filter_complex"]:
+        if info["has_hdr_to_sdr_filter_complex"]:
+            if ENABLE_FILTER_COMPLEX_HDR_TO_HDR == 1:
+                report["hdr_to_hdr"].append(
+                    "BAIL: ENABLE_FILTER_COMPLEX_HDR_TO_HDR=1 but filter_complex rewrite is not implemented safely yet"
+                )
+            else:
+                report["hdr_to_hdr"].append(
+                    "BAIL: HDR->SDR tonemap found inside -filter_complex; "
+                    "this is usually subtitle burn-in/overlay. "
+                    "ENABLE_FILTER_COMPLEX_HDR_TO_HDR=0, so passing through."
+                )
+        else:
+            report["hdr_to_hdr"].append(
+                "BAIL: -filter_complex present but no HDR->SDR tonemap markers found"
+            )
+        return argv
+
+    if not info["has_hdr_to_sdr_vf"]:
+        report["hdr_to_hdr"].append(
+            "BAIL: no simple -vf/-filter:v Jellyfin HDR->SDR tonemapx filter found"
+        )
+        return argv
+
+    if not client_decision.get("allow_hdr_to_hdr"):
+        report["hdr_to_hdr"].append(
+            "BAIL: blocking client decision did not allow HDR->HDR: "
+            + client_decision.get("reason", "unknown reason")
+        )
+        return argv
+
+    out = argv[:]
+    changed_filter = False
+
+    filter_options = {
+        "-vf",
+        "-filter:v",
+        "-filter:v:0",
+        "-filter_complex:v",
+    }
+
+    i = 0
+    while i < len(out):
+        if out[i] in filter_options and i + 1 < len(out):
+            original_filter = out[i + 1]
+
+            if is_hdr_to_sdr_filter(original_filter):
+                out[i + 1], replacement_msg = replace_tonemapx_with_hdr_to_hdr(original_filter)
+                report["hdr_to_hdr"].append(f"FILTER_REWRITE: {out[i]} {replacement_msg}")
+                changed_filter = True
+
+            i += 2
+        else:
+            i += 1
+
+    if not changed_filter:
+        report["hdr_to_hdr"].append(
+            "BAIL: classification said HDR->SDR filter exists, but rewrite loop did not change anything"
+        )
+        return argv
+
+    # Force HEVC Main10 output for HDR->HDR.
+    out, actions = set_or_add_option(out, ["-profile:v:0", "-profile:v"], "main10")
+    report["hdr_to_hdr"].extend(actions)
+
+    out, actions = set_or_add_option(out, ["-pix_fmt"], "yuv420p10le")
+    report["hdr_to_hdr"].extend(actions)
+
+    # Force HDR output metadata.
+    for opt, value in [
+        ("-color_primaries", "bt2020"),
+        ("-color_trc", "smpte2084"),
+        ("-colorspace", "bt2020nc"),
+        ("-color_range", "tv"),
+    ]:
+        out, actions = set_or_add_option(out, [opt], value)
+        report["hdr_to_hdr"].extend(actions)
+
+    # Patch x265 params for HDR signaling.
+    patched_x265 = False
+    i = 0
+    while i < len(out):
+        if out[i].startswith("-x265-params") and i + 1 < len(out):
+            old_params = out[i + 1]
+            out[i + 1], actions = rewrite_x265_params(out[i + 1])
+            report["hdr_to_hdr"].append(f"UPDATED: {out[i]} for HDR signaling")
+            report["hdr_to_hdr"].extend(actions)
+            patched_x265 = True
+            if old_params == out[i + 1]:
+                report["hdr_to_hdr"].append("NOTE: x265 params text unchanged after patch")
+            break
+        i += 1
+
+    if not patched_x265:
+        # Add before output path.
+        out = out[:-1] + [
+            "-x265-params:0",
+            ":".join(f"{k}={v}" for k, v in HDR_X265_PARAMS.items()),
+        ] + out[-1:]
+        report["hdr_to_hdr"].append("ADDED: -x265-params:0 HDR signaling params")
+
+    report["hdr_to_hdr"].append("SUCCESS: HDR_TO_HDR_REWRITE_APPLIED")
+    return out
+
+
+def rewrite_argv(argv, report, client_decision):
+    if KILL_SWITCH == 1:
+        report["global"].append("KILL_SWITCH=1: total passthrough")
+        return argv, "KILL_SWITCH_PASSTHROUGH"
+
+    out = argv[:]
+    mode_parts = []
+
+    if ENABLE_BITRATE_MIN == 1:
+        out, minrate_changes = apply_minrate_from_maxrate(out)
+        if minrate_changes:
+            mode_parts.append("MINRATE_FROM_MAXRATE")
+            report["bitrate_min"].append("ENABLED: ENABLE_BITRATE_MIN=1")
+            report["bitrate_min"].extend(minrate_changes)
+        else:
+            mode_parts.append("NO_MINRATE_CHANGE")
+            report["bitrate_min"].append(
+                "ENABLED: ENABLE_BITRATE_MIN=1 but no parseable -maxrate was found"
+            )
+    else:
+        mode_parts.append("BITRATE_MIN_DISABLED")
+        report["bitrate_min"].append("DISABLED: ENABLE_BITRATE_MIN=0")
+
+    before_hdr = out[:]
+    out = rewrite_hdr_to_hdr(out, report, client_decision)
+
+    if out != before_hdr:
+        mode_parts.append("HDR_TO_HDR_REWRITE_APPLIED")
+    else:
+        mode_parts.append("HDR_TO_HDR_NOT_APPLIED")
+
+    return out, " + ".join(mode_parts)
+
+
+def log_report(report, original, rewritten, mode):
+    log("================================================================================")
+    log("==== " + datetime.now().isoformat() + " ====")
+    log("CONFIG:")
+    log(f"  CONFIG_FILE={CONFIG_FILE!r}")
+    log(f"  CONFIG_LOAD_ERROR={CONFIG_LOAD_ERROR!r}")
+    log(f"  REAL_FFMPEG={REAL_FFMPEG!r}")
+    log(f"  LOG_FILE={LOG_FILE!r}")
+    log(f"  KILL_SWITCH={KILL_SWITCH}")
+    log(f"  ENABLE_HDR_TO_HDR={ENABLE_HDR_TO_HDR}")
+    log(f"  ENABLE_BITRATE_MIN={ENABLE_BITRATE_MIN}")
+    log(f"  ENABLE_BLOCKING_CLIENT_DECISION={ENABLE_BLOCKING_CLIENT_DECISION}")
+    log(f"  ENABLE_FILTER_COMPLEX_HDR_TO_HDR={ENABLE_FILTER_COMPLEX_HDR_TO_HDR}")
+    log(f"  MINRATE_RATIO={MINRATE_RATIO}")
+    log(f"MODE: {mode}")
+
+    log(f"  HDR_ALLOW_LIST={HDR_ALLOW_LIST}")
+    log(f"  HDR_DENY_LIST={HDR_DENY_LIST}")
+
+    for section in ["global", "blocking_client_decision", "bitrate_min", "hdr_to_hdr"]:
+        entries = report.get(section) or []
+        log(f"{section.upper()}:")
+        if entries:
+            for entry in entries:
+                log(f"  - {entry}")
+        else:
+            log("  - no entries")
+
+    if LOG_FULL_ARGV == 1:
+        log("ORIGINAL_ARGV:")
+        log("  " + shell_join([REAL_FFMPEG] + original))
+
+        if rewritten != original:
+            log("REWRITTEN_ARGV:")
+            log("  " + shell_join([REAL_FFMPEG] + rewritten))
+        else:
+            log("REWRITTEN_ARGV:")
+            log("  unchanged / passthrough")
+
+    if ENABLE_HDR_TO_HDR == 1:
+        if rewritten != original and any("SUCCESS: HDR_TO_HDR_REWRITE_APPLIED" in x for x in report["hdr_to_hdr"]):
+            log("HDR_TO_HDR_STATUS: ENABLED_AND_APPLIED")
+        else:
+            log("HDR_TO_HDR_STATUS: ENABLED_BUT_NOT_APPLIED_SEE_BAIL_REASON")
+    else:
+        log("HDR_TO_HDR_STATUS: DISABLED")
+
+    log("")
+
+
+def main():
+    original = sys.argv[1:]
+
+    report = {
+        "global": [],
+        "blocking_client_decision": [],
+        "bitrate_min": [],
+        "hdr_to_hdr": [],
+    }
+
+    if KILL_SWITCH == 1:
+        report["global"].append("KILL_SWITCH=1: not calling Jellyfin and not rewriting argv")
+        rewritten = original
+        mode = "KILL_SWITCH_PASSTHROUGH"
+        log_report(report, original, rewritten, mode)
+        os.execv(REAL_FFMPEG, [REAL_FFMPEG] + rewritten)
+
+    command_info = classify_command(original)
+    if (
+        ENABLE_HDR_TO_HDR == 1
+        and (
+            command_info["has_hdr_to_sdr_vf"]
+            or command_info["is_supported_vaapi_qsv_pipeline"]
+        )
+        and not command_info["has_filter_complex"]
+        and (
+            command_info["video_encoder"] == "libx265"
+            or command_info["is_supported_vaapi_qsv_pipeline"]
+        )
+    ):
+        client_decision = blocking_client_decision(original, report)
+    else:
+        client_decision = {
+            "allow_hdr_to_hdr": False,
+            "reason": "command is not a supported HDR->SDR rewrite candidate",
+        }
+        report["blocking_client_decision"].append(
+            "SKIPPED: command is not a supported HDR->SDR rewrite candidate"
+        )
+
+    rewritten, mode = rewrite_argv(original, report, client_decision)
+
+    log_report(report, original, rewritten, mode)
+
+    os.execv(REAL_FFMPEG, [REAL_FFMPEG] + rewritten)
+
+
+if __name__ == "__main__":
+    main()

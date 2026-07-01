@@ -1,0 +1,40 @@
+{
+  "shim": {
+    "kill_switch": false,
+    "enable_hdr_to_hdr": true,
+    "enable_bitrate_min": true,
+    "enable_blocking_client_decision": true,
+    "enable_filter_complex_hdr_to_hdr": false,
+    "log_full_argv": true
+  },
+  "jellyfin": {
+    "url": "http://127.0.0.1:8096",
+    "api_key": "PASTE_YOUR_API_KEY_HERE"
+  },
+  "paths": {
+    "ffmpeg_binary": "/usr/lib/jellyfin-ffmpeg/ffmpeg",
+    "log_file": "/var/log/jellyfin/jellyfin-ffmpeg-shim.log"
+  },
+  "tuning": {
+    "minrate_ratio": 0.70,
+    "blocking_decision_poll_delays_seconds": [0.0, 0.25, 0.75, 1.5, 2.5],
+    "blocking_decision_api_timeout_seconds": 1.0
+  },
+  "hdr_access": {
+    "allow_list": [
+      {
+        "username": "nullstring",
+        "devices": ["chrome", "midoriko"]
+      }
+    ],
+    "deny_list": [
+      {
+        "username": "nullstring",
+        "devices": ["firefox"]
+      },
+      {
+        "username": "jena"
+      }
+    ]
+  }
+}
