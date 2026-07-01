@@ -966,3 +966,35 @@ Known limitations:
 - DV reshaping shares the iGPU's decode/compute/encode resources. Concurrent
   playback/transcoding reduced the same benchmark to roughly `0.94x`.
 - Other Profile 5 command/filter shapes fail closed.
+
+## Hardware backend architecture (uncommitted, pkgrel 17)
+
+Hardware selection is derived exclusively from each FFmpeg argv, not from the
+host GPU or a configured vendor assumption. `detect_hardware_backend()`
+classifies Intel QSV, vendor-neutral VAAPI, NVIDIA CUDA/NVENC, AMD AMF, Vulkan
+Video, Apple VideoToolbox, unknown hardware, and software commands.
+
+Only the previously working Intel QSV behavior is registered in
+`HARDWARE_BACKEND_REWRITERS`. No new AMD, NVIDIA, native VAAPI, Vulkan, or
+VideoToolbox rewrite support was added. Detected backends without a registered
+handler log their backend identity and pass through unchanged. Future support
+should be added as a backend handler rather than by adding vendor conditions to
+`rewrite_hdr_to_hdr()`.
+
+Backend metadata is kept in `HARDWARE_BACKENDS`; it is descriptive and does not
+enable behavior. Intel-specific functions are explicitly named
+`rewrite_intel_qsv_*`. The generic flow performs source/client safety decisions
+and then dispatches through `rewrite_hardware_backend()`.
+
+The Intel backend does not encode a GPU model, PCI ID, render node, driver name,
+or generation. Supported argv shapes are named in
+`HARDWARE_PIPELINE_VARIANTS`, with explicit capability requirements (P010
+filtering/mapping, OpenCL DV reshaping where applicable, and QSV Main10 encode).
+The shim matches the graph Jellyfin selected; it does not independently select
+hardware. Frame-pool sizes such as `extra_hw_frames` are preserved from the
+incoming Jellyfin graph rather than hardcoded from the development host.
+
+Regression tests are in `tests/test_hardware_backends.py`. They verify backend
+detection, fail-closed passthrough for unimplemented families, software x265
+classification even when Jellyfin initializes unused devices, and preservation
+of the existing Intel HDR/DV graph rewrites and incoming frame-pool sizes.

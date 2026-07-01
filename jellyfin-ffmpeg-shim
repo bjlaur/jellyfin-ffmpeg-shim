@@ -765,7 +765,11 @@ def replace_vaapi_tonemap_with_hdr(value: str) -> tuple[str, str]:
             removed_procamp += 1
             continue
         if name.startswith("tonemap_vaapi="):
-            rewritten.append(HDR_VAAPI_FILTER)
+            frame_pool = re.search(r"(?:^|:)extra_hw_frames=(\d+)(?:$|:)", name)
+            replacement = HDR_VAAPI_FILTER
+            if frame_pool:
+                replacement += f":extra_hw_frames={frame_pool.group(1)}"
+            rewritten.append(replacement)
             replaced_tonemap += 1
             continue
         rewritten.append(part)
@@ -779,7 +783,7 @@ def replace_vaapi_tonemap_with_hdr(value: str) -> tuple[str, str]:
     )
 
 
-def rewrite_vaapi_qsv_subtitle_graph(value: str) -> tuple[str, str]:
+def rewrite_intel_qsv_subtitle_graph(value: str) -> tuple[str, str]:
     branches = value.split(";")
     if len(branches) != 3:
         return value, f"BAIL: expected exactly three filter branches, found {len(branches)}"
@@ -790,6 +794,13 @@ def rewrite_vaapi_qsv_subtitle_graph(value: str) -> tuple[str, str]:
         return value, "BAIL: overlay_qsv output dimensions were not found"
     output_width, output_height = dimensions.groups()
 
+    subtitle_upload = re.search(
+        r",hwupload=derive_device=qsv(?P<options>:[^,;\[\]]*)?\[sub\]$",
+        subtitle_branch,
+    )
+    subtitle_upload_options = (
+        subtitle_upload.group("options") if subtitle_upload else ""
+    )
     subtitle_branch, upload_count = re.subn(
         r",hwupload=derive_device=qsv(?P<options>:[^,;\[\]]*)?\[sub\]$",
         "[sub]",
@@ -825,7 +836,8 @@ def rewrite_vaapi_qsv_subtitle_graph(value: str) -> tuple[str, str]:
         overlay_options[0]
         + "overlay=eof_action=pass:repeatlast=0:format=yuv420p10"
         + ",format=p010le"
-        + ",hwupload=derive_device=qsv:extra_hw_frames=64"
+        + ",hwupload=derive_device=qsv"
+        + subtitle_upload_options
         + ",format=qsv"
     )
 
@@ -882,6 +894,121 @@ def rewrite_x265_params(params: str) -> tuple[str, list[str]]:
     return ":".join(kept), actions
 
 
+HARDWARE_BACKENDS = {
+    "intel_qsv": {
+        "label": "Intel QSV",
+        "implemented_modes": ["hdr10_base", "dovi_profile5", "subtitle_burnin"],
+        "required_capabilities": [
+            "VAAPI P010 surfaces",
+            "QSV HEVC Main10 encode",
+            "VAAPI-to-QSV frame mapping",
+        ],
+    },
+    "vaapi": {
+        "label": "VAAPI (vendor-neutral)",
+        "implemented_modes": [],
+        "required_capabilities": [],
+    },
+    "nvidia_cuda": {
+        "label": "NVIDIA CUDA/NVENC",
+        "implemented_modes": [],
+        "required_capabilities": [],
+    },
+    "amd_amf": {
+        "label": "AMD AMF",
+        "implemented_modes": [],
+        "required_capabilities": [],
+    },
+    "vulkan": {
+        "label": "Vulkan Video",
+        "implemented_modes": [],
+        "required_capabilities": [],
+    },
+    "videotoolbox": {
+        "label": "Apple VideoToolbox",
+        "implemented_modes": [],
+        "required_capabilities": [],
+    },
+    "unknown_hardware": {
+        "label": "unrecognized hardware pipeline",
+        "implemented_modes": [],
+        "required_capabilities": [],
+    },
+    "software": {
+        "label": "software",
+        "implemented_modes": ["hdr10_base"],
+        "required_capabilities": [],
+    },
+}
+
+HARDWARE_PIPELINE_VARIANTS = {
+    "vaapi_qsv_hdr10": {
+        "backend": "intel_qsv",
+        "required_capabilities": [
+            "VAAPI P010 filtering",
+            "VAAPI-to-QSV frame mapping",
+            "QSV HEVC Main10 encode",
+        ],
+    },
+    "vaapi_qsv_subtitle_overlay": {
+        "backend": "intel_qsv",
+        "required_capabilities": [
+            "VAAPI P010 filtering and download",
+            "QSV P010 upload",
+            "QSV HEVC Main10 encode",
+        ],
+    },
+    "vaapi_opencl_qsv_dovi": {
+        "backend": "intel_qsv",
+        "required_capabilities": [
+            "VAAPI-to-OpenCL P010 mapping",
+            "tonemap_opencl Dolby Vision reshaping",
+            "OpenCL-to-QSV P010 mapping",
+            "QSV HEVC Main10 encode",
+        ],
+    },
+}
+
+
+def detect_hardware_backend(argv, video_encoder, vf, filter_complex):
+    """Identify the command's backend from FFmpeg argv, never host hardware."""
+    joined = "\n".join(argv)
+    filters = "\n".join(value for value in (vf, filter_complex) if value)
+    encoder = video_encoder or ""
+
+    if encoder.endswith("_qsv") or any(marker in filters for marker in (
+        "format=qsv", "derive_device=qsv", "overlay_qsv=", "vpp_qsv=",
+    )):
+        backend_id = "intel_qsv"
+    elif encoder.endswith("_nvenc") or any(marker in joined for marker in (
+        "-hwaccel\ncuda", "_cuda", "format=cuda", "derive_device=cuda",
+    )):
+        backend_id = "nvidia_cuda"
+    elif encoder.endswith("_amf") or "_amf" in filters:
+        backend_id = "amd_amf"
+    elif encoder.endswith("_vaapi") or any(marker in filters for marker in (
+        "tonemap_vaapi=", "scale_vaapi=", "overlay_vaapi=", "format=vaapi",
+    )):
+        backend_id = "vaapi"
+    elif encoder.endswith("_vulkan") or "format=vulkan" in filters:
+        backend_id = "vulkan"
+    elif encoder.endswith("_videotoolbox") or "_videotoolbox" in filters:
+        backend_id = "videotoolbox"
+    elif encoder in {"libx264", "libx265", "libaom-av1", "libsvtav1"}:
+        backend_id = "software"
+    elif any(marker in joined for marker in (
+        "-hwaccel", "-init_hw_device", "-filter_hw_device",
+    )):
+        backend_id = "unknown_hardware"
+    else:
+        backend_id = "software"
+
+    return {
+        "id": backend_id,
+        **HARDWARE_BACKENDS[backend_id],
+    }
+
+
 def classify_command(argv):
     joined = "\n".join(argv)
 
@@ -913,14 +1040,8 @@ def classify_command(argv):
     )
 
     video_encoder = get_option_value(argv, {"-codec:v:0", "-c:v:0", "-codec:v", "-c:v"})
-
-    is_hw_pipeline = any(x in joined for x in [
-        "hevc_qsv",
-        "tonemap_vaapi",
-        "procamp_vaapi",
-        "hwmap=derive_device=qsv",
-        "format=qsv",
-    ])
+    backend = detect_hardware_backend(argv, video_encoder, vf, filter_complex)
+    is_hw_pipeline = backend["id"] != "software"
 
     is_supported_vaapi_qsv_pipeline = bool(
         video_encoder == "hevc_qsv"
@@ -945,9 +1066,28 @@ def classify_command(argv):
         and "[main][sub]overlay_qsv=" in filter_complex
         and "-hwaccel_output_format\nvaapi" in joined
     )
+    if is_supported_vaapi_qsv_subtitle_pipeline:
+        hardware_pipeline_variant = "vaapi_qsv_subtitle_overlay"
+    elif is_supported_vaapi_qsv_pipeline:
+        hardware_pipeline_variant = "vaapi_qsv_hdr10"
+    elif (
+        backend["id"] == "intel_qsv"
+        and video_encoder == "hevc_qsv"
+        and has_opencl_hdr_to_sdr_vf
+        and vf
+        and "hwmap=derive_device=opencl:mode=read" in vf
+        and "hwmap=derive_device=qsv:mode=write:reverse=1" in vf
+    ):
+        hardware_pipeline_variant = "vaapi_opencl_qsv_dovi"
+    elif is_hw_pipeline:
+        hardware_pipeline_variant = "unrecognized"
+    else:
+        hardware_pipeline_variant = None
 
     return {
         "video_encoder": video_encoder,
+        "hardware_backend": backend,
+        "hardware_pipeline_variant": hardware_pipeline_variant,
         "has_filter_complex": filter_complex is not None,
         "has_hdr_to_sdr_vf": has_hdr_to_sdr_vf,
         "has_hdr_to_sdr_filter_complex": has_hdr_to_sdr_filter_complex,
@@ -960,7 +1100,7 @@ def classify_command(argv):
     }
 
 
-def rewrite_vaapi_qsv_hdr_to_hdr(argv, report, use_filter_complex=False):
+def rewrite_intel_qsv_hdr_to_hdr(argv, report, use_filter_complex=False):
     out = argv[:]
     changed_filter = False
 
@@ -970,7 +1110,7 @@ def rewrite_vaapi_qsv_hdr_to_hdr(argv, report, use_filter_complex=False):
         }
         if out[index] in filter_options:
             if use_filter_complex:
-                rewritten_filter, message = rewrite_vaapi_qsv_subtitle_graph(out[index + 1])
+                rewritten_filter, message = rewrite_intel_qsv_subtitle_graph(out[index + 1])
             else:
                 rewritten_filter, message = replace_vaapi_tonemap_with_hdr(out[index + 1])
             if rewritten_filter == out[index + 1]:
@@ -1054,6 +1194,76 @@ def rewrite_opencl_dovi_to_hdr10(argv, report):
     return out
 
 
+def rewrite_intel_qsv_backend(
+    argv, report, info, source_decision, client_decision
+):
+    """Existing Intel-specific implementations behind the backend boundary."""
+    conversion_mode = source_decision.get("conversion_mode")
+    variant = info["hardware_pipeline_variant"]
+
+    if conversion_mode == "dovi_profile5_to_hdr10":
+        if variant != "vaapi_opencl_qsv_dovi":
+            report["hdr_to_hdr"].append(
+                "BAIL: Intel QSV Profile 5 conversion requires the recognized OpenCL-to-QSV graph"
+            )
+            return argv
+        return rewrite_opencl_dovi_to_hdr10(argv, report)
+
+    if variant == "vaapi_qsv_subtitle_overlay":
+        if ENABLE_FILTER_COMPLEX_HDR_TO_HDR != 1:
+            report["hdr_to_hdr"].append(
+                "BAIL: supported Intel QSV subtitle graph found, but "
+                "ENABLE_FILTER_COMPLEX_HDR_TO_HDR=0"
+            )
+            return argv
+        return rewrite_intel_qsv_hdr_to_hdr(argv, report, use_filter_complex=True)
+
+    if variant == "vaapi_qsv_hdr10":
+        return rewrite_intel_qsv_hdr_to_hdr(argv, report)
+
+    report["hdr_to_hdr"].append(
+        "BAIL: Intel QSV command does not match a supported rewrite graph"
+    )
+    return argv
+
+
+HARDWARE_BACKEND_REWRITERS = {
+    # Future AMD/NVIDIA/VAAPI/Vulkan handlers belong here. Detection is already
+    # independent of dispatch, and an absent handler always means passthrough.
+    "intel_qsv": rewrite_intel_qsv_backend,
+}
+
+
+def rewrite_hardware_backend(
+    argv, report, info, source_decision, client_decision
+):
+    backend = info["hardware_backend"]
+    variant = info["hardware_pipeline_variant"]
+    variant_requirements = HARDWARE_PIPELINE_VARIANTS.get(variant, {}).get(
+        "required_capabilities", []
+    )
+    report["hdr_to_hdr"].append(
+        f"HARDWARE_BACKEND: id={backend['id']!r} label={backend['label']!r} "
+        f"variant={variant!r} required_capabilities={variant_requirements!r}"
+    )
+
+    handler = HARDWARE_BACKEND_REWRITERS.get(backend["id"])
+    if handler is None:
+        report["hdr_to_hdr"].append(
+            f"BAIL: no HDR rewrite handler is implemented for {backend['label']}; passthrough"
+        )
+        return argv
+
+    if not client_decision.get("allow_hdr_to_hdr"):
+        report["hdr_to_hdr"].append(
+            "BAIL: blocking client decision did not allow hardware HDR rewrite: "
+            + client_decision.get("reason", "unknown reason")
+        )
+        return argv
+
+    return handler(argv, report, info, source_decision, client_decision)
+
+
 def rewrite_hdr_to_hdr(argv, report, client_decision, source_decision):
     """
     Rewrite Jellyfin software HDR->SDR tonemapx command into HDR->HDR.
@@ -1078,48 +1288,10 @@ def rewrite_hdr_to_hdr(argv, report, client_decision, source_decision):
         )
         return argv
 
-    if source_decision.get("conversion_mode") == "dovi_profile5_to_hdr10":
-        if not info["has_opencl_hdr_to_sdr_vf"] or info["video_encoder"] != "hevc_qsv":
-            report["hdr_to_hdr"].append(
-                "BAIL: Profile 5 conversion currently requires Jellyfin's OpenCL-to-QSV pipeline"
-            )
-            return argv
-        if not client_decision.get("allow_hdr_to_hdr"):
-            report["hdr_to_hdr"].append(
-                "BAIL: blocking client decision did not allow DV->HDR10: "
-                + client_decision.get("reason", "unknown reason")
-            )
-            return argv
-        return rewrite_opencl_dovi_to_hdr10(argv, report)
-
-    if info["is_supported_vaapi_qsv_subtitle_pipeline"]:
-        if ENABLE_FILTER_COMPLEX_HDR_TO_HDR != 1:
-            report["hdr_to_hdr"].append(
-                "BAIL: supported VAAPI/QSV subtitle graph found, but ENABLE_FILTER_COMPLEX_HDR_TO_HDR=0"
-            )
-            return argv
-        if not client_decision.get("allow_hdr_to_hdr"):
-            report["hdr_to_hdr"].append(
-                "BAIL: blocking client decision did not allow HDR->HDR: "
-                + client_decision.get("reason", "unknown reason")
-            )
-            return argv
-        return rewrite_vaapi_qsv_hdr_to_hdr(argv, report, use_filter_complex=True)
-
-    if info["is_supported_vaapi_qsv_pipeline"]:
-        if not client_decision.get("allow_hdr_to_hdr"):
-            report["hdr_to_hdr"].append(
-                "BAIL: blocking client decision did not allow HDR->HDR: "
-                + client_decision.get("reason", "unknown reason")
-            )
-            return argv
-        return rewrite_vaapi_qsv_hdr_to_hdr(argv, report)
-
     if info["is_hw_pipeline"]:
-        report["hdr_to_hdr"].append(
-            "BAIL: unsupported hardware filter graph; supported hardware path is VAAPI HDR input to QSV Main10"
+        return rewrite_hardware_backend(
+            argv, report, info, source_decision, client_decision
         )
-        return argv
 
     if info["video_encoder"] != "libx265":
         report["hdr_to_hdr"].append(
