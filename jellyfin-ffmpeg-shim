@@ -28,6 +28,7 @@ import os
 import sys
 import shlex
 import re
+import subprocess
 import json
 import time
 import urllib.request
@@ -41,9 +42,11 @@ CONFIG_LOAD_ERROR = None
 # the single intentional deployment fallback so invalid configuration can still
 # provide total passthrough.
 EMERGENCY_REAL_FFMPEG = "/usr/lib/jellyfin-ffmpeg/ffmpeg"
+EMERGENCY_LOG_FILE = "/var/log/jellyfin/jellyfin-ffmpeg-shim.log"
 KILL_SWITCH = True
 REAL_FFMPEG = EMERGENCY_REAL_FFMPEG
-LOG_FILE = None
+FFPROBE_BINARY = None
+LOG_FILE = EMERGENCY_LOG_FILE
 ENABLE_HDR_TO_HDR = False
 ENABLE_BITRATE_MIN = False
 ENABLE_BLOCKING_CLIENT_DECISION = False
@@ -54,8 +57,10 @@ JELLYFIN_URL = None
 JELLYFIN_API_KEY = ""
 BLOCKING_DECISION_POLL_DELAYS_SECONDS = None
 BLOCKING_DECISION_API_TIMEOUT_SECONDS = None
+SOURCE_PROBE_TIMEOUT_SECONDS = None
 HDR_ALLOW_LIST = []
 HDR_DENY_LIST = []
+_LOG_FAILURE_REPORTED = False
 
 
 def _config_bool(section, key):
@@ -114,9 +119,10 @@ def load_config(path: str = CONFIG_FILE) -> None:
     global ENABLE_BLOCKING_CLIENT_DECISION
     global ENABLE_FILTER_COMPLEX_HDR_TO_HDR, LOG_FULL_ARGV
     global JELLYFIN_URL, JELLYFIN_API_KEY
-    global REAL_FFMPEG, LOG_FILE
+    global REAL_FFMPEG, FFPROBE_BINARY, LOG_FILE
     global MINRATE_RATIO, BLOCKING_DECISION_POLL_DELAYS_SECONDS
     global BLOCKING_DECISION_API_TIMEOUT_SECONDS
+    global SOURCE_PROBE_TIMEOUT_SECONDS
     global HDR_ALLOW_LIST, HDR_DENY_LIST
     global CONFIG_LOAD_ERROR
 
@@ -161,12 +167,16 @@ def load_config(path: str = CONFIG_FILE) -> None:
 
         REAL_FFMPEG = paths["ffmpeg_binary"]
         LOG_FILE = paths["log_file"]
+        # Load the log path before newer required path fields so schema errors
+        # can still be reported to the administrator's configured log.
+        FFPROBE_BINARY = paths["ffprobe_binary"]
         if not all(
             isinstance(value, str) and value.strip()
-            for value in (REAL_FFMPEG, LOG_FILE)
+            for value in (REAL_FFMPEG, FFPROBE_BINARY, LOG_FILE)
         ):
             raise ValueError("all configured paths must be non-empty strings")
         REAL_FFMPEG = REAL_FFMPEG.strip()
+        FFPROBE_BINARY = FFPROBE_BINARY.strip()
         LOG_FILE = LOG_FILE.strip()
 
         MINRATE_RATIO = _config_number(
@@ -178,6 +188,9 @@ def load_config(path: str = CONFIG_FILE) -> None:
         BLOCKING_DECISION_API_TIMEOUT_SECONDS = _config_number(
             tuning, "blocking_decision_api_timeout_seconds",
             minimum=0.01,
+        )
+        SOURCE_PROBE_TIMEOUT_SECONDS = _config_number(
+            tuning, "source_probe_timeout_seconds", minimum=0.01
         )
         if not JELLYFIN_API_KEY or JELLYFIN_API_KEY == "PASTE_YOUR_API_KEY_HERE":
             KILL_SWITCH = 1
@@ -191,6 +204,7 @@ def load_config(path: str = CONFIG_FILE) -> None:
         # Invalid configuration must result in total passthrough.
         KILL_SWITCH = 1
         REAL_FFMPEG = EMERGENCY_REAL_FFMPEG
+        LOG_FILE = EMERGENCY_LOG_FILE
         JELLYFIN_API_KEY = ""
         CONFIG_LOAD_ERROR = (
             f"invalid config; forced KILL_SWITCH=1: {type(error).__name__}: {error}"
@@ -227,14 +241,25 @@ HDR_X265_PARAMS = {
 
 
 def log(msg: str = "") -> None:
+    global _LOG_FAILURE_REPORTED
     try:
         with open(LOG_FILE, "a", encoding="utf-8") as f:
             f.write(msg)
             if not msg.endswith("\n"):
                 f.write("\n")
-    except Exception:
-        # Logging must never break playback.
-        pass
+    except Exception as error:
+        # Logging must never break playback, but one stderr diagnostic will be
+        # captured in Jellyfin's FFmpeg log and prevents silent failures.
+        if not _LOG_FAILURE_REPORTED:
+            _LOG_FAILURE_REPORTED = True
+            try:
+                print(
+                    f"jellyfin-ffmpeg-shim: cannot write log {LOG_FILE!r}: "
+                    f"{type(error).__name__}: {error}",
+                    file=sys.stderr,
+                )
+            except Exception:
+                pass
 
 
 def shell_join(argv):
@@ -289,6 +314,123 @@ def parse_ffmpeg_argv_for_decision(argv):
         "output_basenames": [os.path.basename(x) for x in output_paths if x],
         "hls_stems": hls_stems,
     }
+
+
+def probe_source_hdr_compatibility(argv, report):
+    decision = {
+        "allow_hdr_preservation": False,
+        "reason": "source probe did not run",
+        "summary": None,
+        "probe_attempted": True,
+    }
+    parsed = parse_ffmpeg_argv_for_decision(argv)
+    local_inputs = [path for path in parsed["inputs"] if path and os.path.isabs(path)]
+
+    if len(local_inputs) != 1:
+        decision["reason"] = f"expected one absolute local input, found {len(local_inputs)}"
+        report["source_probe"].append(f"DENY: {decision['reason']}")
+        return decision
+
+    input_path = local_inputs[0]
+    command = [
+        FFPROBE_BINARY,
+        "-v", "error",
+        "-select_streams", "v:0",
+        "-show_entries",
+        "stream=codec_name,profile,pix_fmt,color_range,color_space,color_transfer,color_primaries:stream_side_data",
+        "-of", "json",
+        input_path,
+    ]
+
+    try:
+        completed = subprocess.run(
+            command,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=SOURCE_PROBE_TIMEOUT_SECONDS,
+            check=False,
+        )
+    except subprocess.TimeoutExpired:
+        decision["reason"] = f"ffprobe timed out after {SOURCE_PROBE_TIMEOUT_SECONDS}s"
+        report["source_probe"].append(f"DENY: {decision['reason']}")
+        return decision
+    except Exception as error:
+        decision["reason"] = f"ffprobe failed: {type(error).__name__}: {error}"
+        report["source_probe"].append(f"DENY: {decision['reason']}")
+        return decision
+
+    if completed.returncode != 0:
+        stderr = completed.stderr.strip().replace("\n", " ")[:300]
+        decision["reason"] = f"ffprobe exited {completed.returncode}: {stderr}"
+        report["source_probe"].append(f"DENY: {decision['reason']}")
+        return decision
+
+    try:
+        data = json.loads(completed.stdout)
+        streams = data.get("streams") or []
+        if len(streams) != 1 or not isinstance(streams[0], dict):
+            raise ValueError(f"expected one video stream result, found {len(streams)}")
+        stream = streams[0]
+    except Exception as error:
+        decision["reason"] = f"invalid ffprobe JSON: {type(error).__name__}: {error}"
+        report["source_probe"].append(f"DENY: {decision['reason']}")
+        return decision
+
+    dovi = None
+    for side_data in stream.get("side_data_list") or []:
+        if isinstance(side_data, dict) and side_data.get("side_data_type") == "DOVI configuration record":
+            dovi = side_data
+            break
+
+    summary = {
+        "codec_name": stream.get("codec_name"),
+        "profile": stream.get("profile"),
+        "pix_fmt": stream.get("pix_fmt"),
+        "color_range": stream.get("color_range"),
+        "color_space": stream.get("color_space"),
+        "color_transfer": stream.get("color_transfer"),
+        "color_primaries": stream.get("color_primaries"),
+        "dv_profile": dovi.get("dv_profile") if dovi else None,
+        "dv_level": dovi.get("dv_level") if dovi else None,
+        "dv_bl_present": dovi.get("bl_present_flag") if dovi else None,
+        "dv_bl_compatibility_id": dovi.get("dv_bl_signal_compatibility_id") if dovi else None,
+    }
+    decision["summary"] = summary
+
+    is_hdr10_base = bool(
+        stream.get("codec_name") == "hevc"
+        and stream.get("pix_fmt") in {"yuv420p10le", "p010le"}
+        and stream.get("color_primaries") == "bt2020"
+        and stream.get("color_transfer") == "smpte2084"
+        and stream.get("color_space") in {"bt2020nc", "bt2020c"}
+    )
+
+    if dovi:
+        dv_profile = dovi.get("dv_profile")
+        if dv_profile == 5:
+            decision["reason"] = "Dolby Vision Profile 5 has no HDR10 fallback"
+        elif dv_profile not in {7, 8}:
+            decision["reason"] = f"unsupported Dolby Vision profile {dv_profile!r}"
+        elif dovi.get("bl_present_flag") != 1:
+            decision["reason"] = "Dolby Vision base layer is not present"
+        elif not is_hdr10_base:
+            decision["reason"] = "Dolby Vision base layer is not signaled as HDR10 BT.2020/PQ"
+        else:
+            decision["allow_hdr_preservation"] = True
+            decision["reason"] = "Dolby Vision source has an HDR10-compatible base layer"
+    elif is_hdr10_base:
+        decision["allow_hdr_preservation"] = True
+        decision["reason"] = "source is HDR10 BT.2020/PQ"
+    else:
+        decision["reason"] = "source is not verified HDR10 BT.2020/PQ"
+
+    report["source_probe"].append(
+        f"DECISION: {'ALLOW' if decision['allow_hdr_preservation'] else 'DENY'} "
+        f"reason={decision['reason']!r} summary={summary}"
+    )
+    return decision
 
 
 def api_get_sessions():
@@ -674,6 +816,13 @@ def classify_command(argv):
         and "t=bt709" in vf
         and "m=bt709" in vf
     )
+    has_opencl_hdr_to_sdr_vf = bool(
+        vf
+        and "tonemap_opencl=" in vf
+        and "p=bt709" in vf
+        and "t=bt709" in vf
+        and "m=bt709" in vf
+    )
 
     video_encoder = get_option_value(argv, {"-codec:v:0", "-c:v:0", "-codec:v", "-c:v"})
 
@@ -700,6 +849,7 @@ def classify_command(argv):
         "has_hdr_to_sdr_vf": has_hdr_to_sdr_vf,
         "has_hdr_to_sdr_filter_complex": has_hdr_to_sdr_filter_complex,
         "has_vaapi_hdr_to_sdr_vf": has_vaapi_hdr_to_sdr_vf,
+        "has_opencl_hdr_to_sdr_vf": has_opencl_hdr_to_sdr_vf,
         "is_hw_pipeline": is_hw_pipeline,
         "is_supported_vaapi_qsv_pipeline": is_supported_vaapi_qsv_pipeline,
     }
@@ -740,7 +890,7 @@ def rewrite_vaapi_qsv_hdr_to_hdr(argv, report):
     return out
 
 
-def rewrite_hdr_to_hdr(argv, report, client_decision):
+def rewrite_hdr_to_hdr(argv, report, client_decision, source_decision):
     """
     Rewrite Jellyfin software HDR->SDR tonemapx command into HDR->HDR.
     Returns rewritten argv.
@@ -753,6 +903,16 @@ def rewrite_hdr_to_hdr(argv, report, client_decision):
 
     report["hdr_to_hdr"].append("ENABLED: ENABLE_HDR_TO_HDR=1")
     report["hdr_to_hdr"].append(f"COMMAND_CLASSIFICATION: {info}")
+
+    if (
+        source_decision.get("probe_attempted")
+        and not source_decision.get("allow_hdr_preservation")
+    ):
+        report["hdr_to_hdr"].append(
+            "BAIL: source safety probe did not allow HDR preservation: "
+            + source_decision.get("reason", "unknown reason")
+        )
+        return argv
 
     if info["is_supported_vaapi_qsv_pipeline"]:
         if info["has_filter_complex"]:
@@ -769,7 +929,9 @@ def rewrite_hdr_to_hdr(argv, report, client_decision):
         return rewrite_vaapi_qsv_hdr_to_hdr(argv, report)
 
     if info["is_hw_pipeline"]:
-        report["hdr_to_hdr"].append("BAIL: hardware pipeline detected; v1 only handles software libx265 tonemapx")
+        report["hdr_to_hdr"].append(
+            "BAIL: unsupported hardware filter graph; supported hardware path is VAAPI HDR input to QSV Main10"
+        )
         return argv
 
     if info["video_encoder"] != "libx265":
@@ -883,7 +1045,7 @@ def rewrite_hdr_to_hdr(argv, report, client_decision):
     return out
 
 
-def rewrite_argv(argv, report, client_decision):
+def rewrite_argv(argv, report, client_decision, source_decision):
     if KILL_SWITCH == 1:
         report["global"].append("KILL_SWITCH=1: total passthrough")
         return argv, "KILL_SWITCH_PASSTHROUGH"
@@ -907,7 +1069,7 @@ def rewrite_argv(argv, report, client_decision):
         report["bitrate_min"].append("DISABLED: ENABLE_BITRATE_MIN=0")
 
     before_hdr = out[:]
-    out = rewrite_hdr_to_hdr(out, report, client_decision)
+    out = rewrite_hdr_to_hdr(out, report, client_decision, source_decision)
 
     if out != before_hdr:
         mode_parts.append("HDR_TO_HDR_REWRITE_APPLIED")
@@ -924,6 +1086,7 @@ def log_report(report, original, rewritten, mode):
     log(f"  CONFIG_FILE={CONFIG_FILE!r}")
     log(f"  CONFIG_LOAD_ERROR={CONFIG_LOAD_ERROR!r}")
     log(f"  REAL_FFMPEG={REAL_FFMPEG!r}")
+    log(f"  FFPROBE_BINARY={FFPROBE_BINARY!r}")
     log(f"  LOG_FILE={LOG_FILE!r}")
     log(f"  KILL_SWITCH={KILL_SWITCH}")
     log(f"  ENABLE_HDR_TO_HDR={ENABLE_HDR_TO_HDR}")
@@ -936,7 +1099,7 @@ def log_report(report, original, rewritten, mode):
     log(f"  HDR_ALLOW_LIST={HDR_ALLOW_LIST}")
     log(f"  HDR_DENY_LIST={HDR_DENY_LIST}")
 
-    for section in ["global", "blocking_client_decision", "bitrate_min", "hdr_to_hdr"]:
+    for section in ["global", "source_probe", "blocking_client_decision", "bitrate_min", "hdr_to_hdr"]:
         entries = report.get(section) or []
         log(f"{section.upper()}:")
         if entries:
@@ -968,10 +1131,22 @@ def log_report(report, original, rewritten, mode):
 
 
 def main():
+    if sys.argv[1:] == ["--check-config"]:
+        print(json.dumps({
+            "config_file": CONFIG_FILE,
+            "config_load_error": CONFIG_LOAD_ERROR,
+            "kill_switch": KILL_SWITCH,
+            "real_ffmpeg": REAL_FFMPEG,
+            "ffprobe_binary": FFPROBE_BINARY,
+            "log_file": LOG_FILE,
+        }, indent=2, sort_keys=True))
+        return
+
     original = sys.argv[1:]
 
     report = {
         "global": [],
+        "source_probe": [],
         "blocking_client_decision": [],
         "bitrate_min": [],
         "hdr_to_hdr": [],
@@ -985,7 +1160,17 @@ def main():
         os.execv(REAL_FFMPEG, [REAL_FFMPEG] + rewritten)
 
     command_info = classify_command(original)
-    if (
+    is_source_probe_candidate = bool(
+        ENABLE_HDR_TO_HDR == 1
+        and not command_info["has_filter_complex"]
+        and (
+            command_info["has_hdr_to_sdr_vf"]
+            or command_info["has_vaapi_hdr_to_sdr_vf"]
+            or command_info["has_opencl_hdr_to_sdr_vf"]
+        )
+    )
+
+    is_rewrite_candidate = (
         ENABLE_HDR_TO_HDR == 1
         and (
             command_info["has_hdr_to_sdr_vf"]
@@ -996,9 +1181,34 @@ def main():
             command_info["video_encoder"] == "libx265"
             or command_info["is_supported_vaapi_qsv_pipeline"]
         )
-    ):
-        client_decision = blocking_client_decision(original, report)
+    )
+
+    if is_source_probe_candidate:
+        source_decision = probe_source_hdr_compatibility(original, report)
+        if source_decision["allow_hdr_preservation"] and is_rewrite_candidate:
+            client_decision = blocking_client_decision(original, report)
+        elif source_decision["allow_hdr_preservation"]:
+            client_decision = {
+                "allow_hdr_to_hdr": False,
+                "reason": "command uses an unsupported rewrite pipeline",
+            }
+            report["blocking_client_decision"].append(
+                "SKIPPED: command uses an unsupported rewrite pipeline"
+            )
+        else:
+            client_decision = {
+                "allow_hdr_to_hdr": False,
+                "reason": "source safety probe denied HDR preservation",
+            }
+            report["blocking_client_decision"].append(
+                "SKIPPED: source safety probe denied HDR preservation"
+            )
     else:
+        source_decision = {
+            "allow_hdr_preservation": False,
+            "reason": "command is not a supported HDR->SDR rewrite candidate",
+            "probe_attempted": False,
+        }
         client_decision = {
             "allow_hdr_to_hdr": False,
             "reason": "command is not a supported HDR->SDR rewrite candidate",
@@ -1007,7 +1217,7 @@ def main():
             "SKIPPED: command is not a supported HDR->SDR rewrite candidate"
         )
 
-    rewritten, mode = rewrite_argv(original, report, client_decision)
+    rewritten, mode = rewrite_argv(original, report, client_decision, source_decision)
 
     log_report(report, original, rewritten, mode)
 

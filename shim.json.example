@@ -13,12 +13,14 @@
   },
   "paths": {
     "ffmpeg_binary": "/usr/lib/jellyfin-ffmpeg/ffmpeg",
+    "ffprobe_binary": "/usr/lib/jellyfin-ffmpeg/ffprobe",
     "log_file": "/var/log/jellyfin/jellyfin-ffmpeg-shim.log"
   },
   "tuning": {
     "minrate_ratio": 0.70,
     "blocking_decision_poll_delays_seconds": [0.0, 0.25, 0.75, 1.5, 2.5],
-    "blocking_decision_api_timeout_seconds": 1.0
+    "blocking_decision_api_timeout_seconds": 1.0,
+    "source_probe_timeout_seconds": 2.0
   },
   "hdr_access": {
     "allow_list": [
