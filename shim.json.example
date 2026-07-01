@@ -4,7 +4,7 @@
     "enable_hdr_to_hdr": true,
     "enable_bitrate_min": true,
     "enable_blocking_client_decision": true,
-    "enable_filter_complex_hdr_to_hdr": false,
+    "enable_filter_complex_hdr_to_hdr": true,
     "log_full_argv": true
   },
   "jellyfin": {

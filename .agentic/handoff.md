@@ -930,3 +930,39 @@ Future incompatible-HDR conversion policy:
 - HDR10+ to HDR10 should normally preserve the HDR10 base and static metadata while dropping unsupported dynamic metadata.
 - HLG/DV 8.4 to PQ requires a real transfer conversion driven by source/reference metadata.
 - Preserve source luminance intent and metadata when defensible; do not reintroduce a global 400-nit or 1000-nit target.
+
+## Profile 5 to HDR10 implementation (uncommitted, pkgrel 15)
+
+Profile 5 is now allowed only when ffprobe verifies HEVC 10-bit video plus both
+an RPU and base layer. The source decision sets
+`conversion_mode=dovi_profile5_to_hdr10`. This mode is intentionally distinct
+from preserving a Profile 7/8 HDR10-compatible base layer.
+
+The supported Jellyfin command shape is its VAAPI decode/OpenCL SDR/QSV encode
+pipeline. The shim rewrites the existing OpenCL filter in place to:
+
+```text
+hwmap=derive_device=opencl:mode=read,
+tonemap_opencl=format=p010:apply_dovi=true:tonemap=none:peak=0:t=smpte2084:m=bt2020:p=bt2020:r=tv,
+hwmap=derive_device=qsv:mode=write:reverse=1:extra_hw_frames=16,format=qsv
+```
+
+Output is forced to QSV Main10 and tagged limited-range BT.2020/PQ. `peak=0`
+is deliberate: no fixed luminance target is imposed, and the DV RPU reshaping
+produces absolute-PQ HDR10 pixels. The original CPU hybrid path worked but was
+replaced by this zero-copy OpenCL path. With Jellyfin idle, two 300-frame tests
+(default and `tradeoff=enabled`) both processed 12.34 seconds of the Murderbot
+sample in about 9.49 seconds (`1.31x`). Since the tradeoff option had no
+measurable benefit, it is not enabled. A prior encoded result probed as Main10,
+yuv420p10le, tv, bt2020nc, bt2020/smpte2084.
+
+Known limitations:
+
+- DV RPU/dynamic metadata is not retained in the HDR10 output.
+- QSV output currently has correct PQ/color signaling but no static mastering
+  display or MaxCLL/MaxFALL side data. Do not invent these values from one
+  frame. The sample's first decoded RPU reported `source_max_pq=3079`, roughly
+  1000 nits, but this is not hardcoded and other titles can differ.
+- DV reshaping shares the iGPU's decode/compute/encode resources. Concurrent
+  playback/transcoding reduced the same benchmark to roughly `0.94x`.
+- Other Profile 5 command/filter shapes fail closed.
