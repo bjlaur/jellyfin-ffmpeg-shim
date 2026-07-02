@@ -3,8 +3,9 @@
     "kill_switch": false,
     "enable_hdr_to_hdr": true,
     "enable_bitrate_min": true,
-    "enable_blocking_client_decision": true,
+    "enable_client_allow_deny": true,
     "enable_filter_complex_hdr_to_hdr": true,
+    "enable_opencl_subtitle_compositor": true,
     "log_full_argv": true
   },
   "jellyfin": {
@@ -25,17 +26,17 @@
   "hdr_access": {
     "allow_list": [
       {
-        "username": "nullstring",
-        "devices": ["chrome", "midoriko"]
+        "username": "example_user",
+        "devices": ["living room tv", "chrome"]
       }
     ],
     "deny_list": [
       {
-        "username": "nullstring",
+        "username": "example_user",
         "devices": ["firefox"]
       },
       {
-        "username": "jena"
+        "username": "guest"
       }
     ]
   }

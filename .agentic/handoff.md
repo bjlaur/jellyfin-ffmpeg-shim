@@ -71,7 +71,7 @@ Arch Linux package definition.
 - Release: `5`
 - Architecture: `any`
 - Dependencies: `python`, `jellyfin-ffmpeg`
-- Installs the executable to `/usr/bin/jellyfin-ffmpeg-shim`
+- Installs the executable to `/usr/local/bin/jellyfin-ffmpeg-shim`
 - Installs config to `/etc/jellyfin/shim.json`
 - Declares the config as a pacman backup file
 - Uses `SKIP` checksums during active development
@@ -98,7 +98,7 @@ An asynchronous helper named `jellyfin-ffmpeg-shim-hdr-client-detect.py` existed
 Expected installed paths:
 
 ```text
-Shim:          /usr/bin/jellyfin-ffmpeg-shim
+Shim:          /usr/local/bin/jellyfin-ffmpeg-shim
 Real FFmpeg:   /usr/lib/jellyfin-ffmpeg/ffmpeg
 Config:        /etc/jellyfin/shim.json
 Main log:      /var/log/jellyfin/jellyfin-ffmpeg-shim.log
@@ -108,13 +108,13 @@ Jellyfin env:  /etc/jellyfin/jellyfin.env
 The config path can be overridden for testing or alternate installations:
 
 ```bash
-JELLYFIN_SHIM_CONFIG=/path/to/shim.json /usr/bin/jellyfin-ffmpeg-shim ...
+JELLYFIN_SHIM_CONFIG=/path/to/shim.json /usr/local/bin/jellyfin-ffmpeg-shim ...
 ```
 
 Jellyfin must be launched with the shim as its FFmpeg binary. On this server that is controlled by `/etc/jellyfin/jellyfin.env`, ultimately producing:
 
 ```text
---ffmpeg=/usr/bin/jellyfin-ffmpeg-shim
+--ffmpeg=/usr/local/bin/jellyfin-ffmpeg-shim
 ```
 
 After changing `jellyfin.env`, restart Jellyfin:
@@ -135,7 +135,7 @@ The full current example is:
     "kill_switch": false,
     "enable_hdr_to_hdr": true,
     "enable_bitrate_min": true,
-    "enable_blocking_client_decision": true,
+    "enable_client_allow_deny": true,
     "enable_filter_complex_hdr_to_hdr": false,
     "log_full_argv": true
   },
@@ -196,8 +196,9 @@ The shim also forces the kill switch when:
 - The config file is missing.
 - JSON is invalid.
 - A required field is absent or has the wrong type.
-- The API key is blank.
-- The API key is still `PASTE_YOUR_API_KEY_HERE`.
+- Client filtering is enabled and the API key is blank.
+- Client filtering is enabled and the API key is still
+  `PASTE_YOUR_API_KEY_HERE`.
 
 On a malformed config the real FFmpeg path resets to the emergency hardcoded path.
 
@@ -362,6 +363,17 @@ Low confidence/fail closed:
 Important behavior: the shim returns immediately on a medium-confidence candidate. It does not continue polling in hopes of obtaining a later exact path match.
 
 ### Known stale-session concern
+
+There is also a startup-order race that is reproducible in normal use.
+Jellyfin can invoke FFmpeg before `/Sessions` contains the new playback session.
+The shim blocks and polls, but it cannot launch the real FFmpeg until after it
+has made the decision, while Jellyfin may not publish the session until FFmpeg
+has started.  The first attempt can therefore fail to match an allowed client;
+stopping and restarting playback usually succeeds because the session then
+exists.  Treat this as an unresolved functional limitation, not merely a
+logging oddity.  A future design needs a different authoritative source for
+the initiating user/device or a carefully bounded provisional-launch/retry
+strategy.
 
 One successful run selected immediately with:
 
@@ -784,7 +796,7 @@ sudo systemctl restart jellyfin
 Confirm installed source matches repository when expected:
 
 ```bash
-sha256sum ./jellyfin-ffmpeg-shim /usr/bin/jellyfin-ffmpeg-shim
+sha256sum ./jellyfin-ffmpeg-shim /usr/local/bin/jellyfin-ffmpeg-shim
 pacman -Q jellyfin-ffmpeg-shim
 ```
 
@@ -793,7 +805,8 @@ pacman -Q jellyfin-ffmpeg-shim
 Create a real test suite before expanding rewrite shapes. At minimum cover:
 
 - Valid/missing/invalid JSON.
-- Missing/placeholder API key forces total passthrough.
+- Missing/placeholder API key forces total passthrough when client filtering
+  is enabled; it is optional when client filtering is disabled.
 - Emergency FFmpeg fallback on malformed config.
 - Case-insensitive rules.
 - Missing `devices` means all devices.
@@ -919,7 +932,7 @@ The probe is intentionally evaluated before the unsupported-hardware bail so Pro
 `--check-config` prints sanitized config-load state without launching FFmpeg or exposing the API key:
 
 ```bash
-sudo -u jellyfin /usr/bin/jellyfin-ffmpeg-shim --check-config
+sudo -u jellyfin /usr/local/bin/jellyfin-ffmpeg-shim --check-config
 ```
 
 Missing or malformed config uses both emergency fallbacks:
@@ -1005,3 +1018,88 @@ Regression tests are in `tests/test_hardware_backends.py`. They verify backend
 detection, fail-closed passthrough for unimplemented families, software x265
 classification even when Jellyfin initializes unused devices, and preservation
 of the existing Intel HDR/DV graph rewrites and incoming frame-pool sizes.
+
+## Porting to AMD, NVIDIA, and other hardware backends
+
+The policy layer is reusable across vendors: blocking Jellyfin client lookup,
+allow/deny decisions, ffprobe source safety, HDR10/Dolby Vision classification,
+output color metadata, bitrate handling, and fail-closed behavior should remain
+generic.  New hardware support belongs in a backend-specific rewrite handler
+registered in `HARDWARE_BACKEND_REWRITERS`, with its own recognized pipeline
+variants and capability requirements.  Do not infer support merely from a GPU
+vendor name.
+
+The P010/BGRA compositor's color math is also reusable.  It converts SDR
+subtitle graphics to BT.2020/PQ at a configurable subtitle-white luminance and
+blends into limited-range P010.  The difficult vendor-specific work is frame
+interop: importing the decoder surface into the compute API, producing or
+modifying an encoder-compatible surface, synchronizing access, and returning
+it without a full-frame CPU transfer.
+
+### AMD
+
+The closest analogue to the current Intel path is normally VAAPI decode,
+OpenCL or Vulkan compute, and VAAPI encode.  This must be tested against the
+actual Mesa/ROCm/AMD proprietary stack because VAAPI-to-OpenCL external-memory
+mapping is not guaranteed.  Required work:
+
+- Capture the command graphs Jellyfin emits for AMD VAAPI and AMF separately.
+- Prefer a native VAAPI or Vulkan compositor if it can consume P010 plus BGRA
+  and return an encoder-compatible P010 surface correctly.
+- If using OpenCL, verify P010 plane formats, BGRA channel order, external
+  memory import/export, acquire/release synchronization, and whether output
+  surfaces can return to VAAPI without `hwdownload`.
+- Treat AMF as a distinct path.  A VAAPI/OpenCL surface is not automatically
+  an AMF surface; prove zero-copy interoperability or use a different compute
+  backend.
+- Add AMD-specific graph classification, a `rewrite_amd_*` handler, unit tests,
+  and end-to-end tests on both RADV/Mesa and any proprietary stack claimed as
+  supported.
+
+### NVIDIA
+
+Do not force the OpenCL filter into a CUDA/NVDEC/NVENC graph.  NVIDIA's normal
+FFmpeg surfaces are CUDA frames and do not have the Intel VAAPI/OpenCL mapping
+used here.  The likely production solution is a native CUDA filter using the
+same subtitle-to-PQ conversion and P010 blend math.  Required work:
+
+- Implement a CUDA P010/BGRA compositor, preferably operating directly on
+  NVDEC frames and producing NVENC-compatible CUDA frames.
+- Handle pitch, two-plane P010 layout, packed BGRA layout, stream ordering,
+  and CUDA event/stream synchronization explicitly.
+- Preserve frame properties and HDR metadata while forcing Main10 output.
+- Confirm whether Jellyfin uploads subtitle canvases as CUDA/BGRA or whether a
+  small subtitle-only upload stage must be added.
+- Add a recognized CUDA/NVENC pipeline variant and `rewrite_nvidia_cuda_*`
+  handler.  Keep CPU fallback until runtime tests prove the full path.
+- Vulkan external-memory interop is an alternative only if CUDA/Vulkan import,
+  export, and synchronization are demonstrated on supported driver versions.
+
+### Vendor-neutral VAAPI, Vulkan, and other platforms
+
+A native VAAPI compositor could cover Intel and AMD, but the existing
+`overlay_vaapi` P010/BGRA attempt produced green subtitles because the packed
+BGRA surface was interpreted incompatibly.  Support requires either extending
+that filter for explicit mixed-format color conversion or supplying a correct
+hardware subtitle format; do not re-enable the old graph unchanged.
+
+Vulkan/libplacebo may provide a broader future path, but support must be based
+on capabilities such as P010 sampling/renderability, external-memory import,
+and an available hardware encoder—not merely the presence of Vulkan.  The UHD
+630 development system could not use the necessary P010 render target.
+
+Apple VideoToolbox would likely require a Metal/CoreVideo compositor and is a
+separate backend.  Software encoders remain the universal fallback.
+
+### Acceptance requirements for every new backend
+
+- No full-frame GPU-to-CPU-to-GPU round trip in the advertised fast path.
+- Neutral white/gray subtitles, correct colored subtitles, alpha edges, and no
+  modification where subtitle alpha is zero.
+- Correct subtitle timing, including `eof_action=pass:repeatlast=0`.
+- HEVC Main10 output with limited-range BT.2020/PQ signaling and preserved
+  defensible mastering/content-light metadata.
+- Tests for unsupported formats and failed interop that leave the original
+  Jellyfin command unchanged or deliberately choose the known-safe fallback.
+- Real sustained 4K measurements, concurrent-load testing, and driver/version
+  documentation for every configuration claimed as supported.

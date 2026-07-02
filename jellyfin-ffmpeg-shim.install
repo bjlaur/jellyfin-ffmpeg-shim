@@ -11,7 +11,7 @@ post_install() {
   echo 'The following must be done before jellyfin-ffmpeg-shim will be activated:'
   echo
   echo '  - Edit /etc/jellyfin/shim.json and set your Jellyfin API key and HDR access rules.'
-  echo '  - Configure Jellyfin to use /usr/bin/jellyfin-ffmpeg-shim as FFmpeg.'
+  echo '  - Configure Jellyfin to use /usr/local/bin/jellyfin-ffmpeg-shim as FFmpeg.'
   echo '    Check /etc/jellyfin/jellyfin.env for the active FFmpeg setting.'
   echo
   echo 'Until configured, the shim remains in safe passthrough mode.'

@@ -1,0 +1,84 @@
+@startuml
+title jellyfin-ffmpeg-shim HDR rewrite flow
+
+!if %variable_exists("HIGH_DPI")
+skinparam dpi 384
+!endif
+
+skinparam backgroundColor #FCFCFC
+skinparam shadowing false
+skinparam activity {
+  BackgroundColor #EAF2F8
+  BorderColor #365A73
+  DiamondBackgroundColor #FFF2CC
+  DiamondBorderColor #8A6D1D
+  StartColor #2E7D32
+  EndColor #9C2F2F
+  FontColor #17202A
+}
+skinparam note {
+  BackgroundColor #F4F6F7
+  BorderColor #7B7D7D
+}
+
+start
+:Jellyfin launches
+**jellyfin-ffmpeg-shim**;
+
+if (Recognized HDR rewrite graph?) then (yes)
+  if (Software libx265?) then (yes)
+    :Replace SDR **tonemapx** chain
+    with HDR-preserving filter;
+    :Encode with libx265 Main10;
+
+  elseif (VAAPI -> QSV
+  HDR10/base layer?) then (yes)
+    :Remove **procamp_vaapi** and
+    SDR **tonemap_vaapi**;
+    :Insert **scale_vaapi format=p010**
+    preserving BT.2020 / PQ;
+    :Map VAAPI P010 -> QSV
+    and encode HEVC Main10;
+
+  elseif (Dolby Vision Profile 5
+  OpenCL graph?) then (yes)
+    :Replace SDR **tonemap_opencl** with
+    **apply_dovi=true, tonemap=none, peak=0**;
+    :Apply Dolby Vision RPU reshaping
+    to produce HDR10/PQ P010;
+    :Map OpenCL -> QSV
+    and encode HEVC Main10;
+
+  else (QSV subtitle burn-in)
+    :Replace SDR **tonemap_vaapi** with
+    HDR-preserving **scale_vaapi format=p010**;
+
+    if (OpenCL compositor enabled
+    and installed?) then (yes)
+      :Upload BGRA subtitles to OpenCL;
+      :Map VAAPI P010 main -> OpenCL
+      with **mode=read+write**;
+      :Blend with
+      **overlay_p010_bgra_opencl**;
+      :Return OpenCL -> VAAPI (**format=vaapi**)
+      -> QSV -> HEVC Main10;
+    else (software fallback)
+      :Download P010 main frame;
+      :Color-correct software subtitle overlay;
+      :Upload P010 -> QSV
+      and encode HEVC Main10;
+    endif
+  endif
+
+  :Force defensible output signaling:
+  HEVC Main10, limited range,
+  BT.2020 matrix/primaries, PQ transfer;
+else (no)
+  :Leave Jellyfin's FFmpeg graph unchanged;
+endif
+
+:Launch configured real
+**jellyfin-ffmpeg**;
+
+stop
+@enduml

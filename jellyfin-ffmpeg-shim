@@ -16,8 +16,11 @@
 #       If Jellyfin passes -maxrate X, add/update -minrate to MINRATE_RATIO * X.
 #
 #   ENABLE_FILTER_COMPLEX_HDR_TO_HDR = 0
-#       v1 does NOT rewrite filter_complex / subtitle burn-in graphs.
-#       Keep this 0 until we intentionally implement that path.
+#       Enable supported filter_complex / subtitle burn-in rewrites.
+#
+#   ENABLE_OPENCL_SUBTITLE_COMPOSITOR = 1
+#       Prefer the custom OpenCL subtitle compositor. When disabled or
+#       unavailable, use the color-correct software subtitle fallback.
 #
 #   LOG_FULL_ARGV = 1
 #       Log original and rewritten full FFmpeg argv.
@@ -49,8 +52,9 @@ FFPROBE_BINARY = None
 LOG_FILE = EMERGENCY_LOG_FILE
 ENABLE_HDR_TO_HDR = False
 ENABLE_BITRATE_MIN = False
-ENABLE_BLOCKING_CLIENT_DECISION = False
+ENABLE_CLIENT_ALLOW_DENY = False
 ENABLE_FILTER_COMPLEX_HDR_TO_HDR = False
+ENABLE_OPENCL_SUBTITLE_COMPOSITOR = False
 LOG_FULL_ARGV = False
 MINRATE_RATIO = None
 JELLYFIN_URL = None
@@ -116,8 +120,9 @@ def _config_rules(value, key):
 
 def load_config(path: str = CONFIG_FILE) -> None:
     global KILL_SWITCH, ENABLE_HDR_TO_HDR, ENABLE_BITRATE_MIN
-    global ENABLE_BLOCKING_CLIENT_DECISION
-    global ENABLE_FILTER_COMPLEX_HDR_TO_HDR, LOG_FULL_ARGV
+    global ENABLE_CLIENT_ALLOW_DENY
+    global ENABLE_FILTER_COMPLEX_HDR_TO_HDR, ENABLE_OPENCL_SUBTITLE_COMPOSITOR
+    global LOG_FULL_ARGV
     global JELLYFIN_URL, JELLYFIN_API_KEY
     global REAL_FFMPEG, FFPROBE_BINARY, LOG_FILE
     global MINRATE_RATIO, BLOCKING_DECISION_POLL_DELAYS_SECONDS
@@ -150,11 +155,14 @@ def load_config(path: str = CONFIG_FILE) -> None:
         KILL_SWITCH = _config_bool(shim, "kill_switch")
         ENABLE_HDR_TO_HDR = _config_bool(shim, "enable_hdr_to_hdr")
         ENABLE_BITRATE_MIN = _config_bool(shim, "enable_bitrate_min")
-        ENABLE_BLOCKING_CLIENT_DECISION = _config_bool(
-            shim, "enable_blocking_client_decision"
+        ENABLE_CLIENT_ALLOW_DENY = _config_bool(
+            shim, "enable_client_allow_deny"
         )
         ENABLE_FILTER_COMPLEX_HDR_TO_HDR = _config_bool(
             shim, "enable_filter_complex_hdr_to_hdr"
+        )
+        ENABLE_OPENCL_SUBTITLE_COMPOSITOR = _config_bool(
+            shim, "enable_opencl_subtitle_compositor"
         )
         LOG_FULL_ARGV = _config_bool(shim, "log_full_argv")
 
@@ -192,9 +200,18 @@ def load_config(path: str = CONFIG_FILE) -> None:
         SOURCE_PROBE_TIMEOUT_SECONDS = _config_number(
             tuning, "source_probe_timeout_seconds", minimum=0.01
         )
-        if not JELLYFIN_API_KEY or JELLYFIN_API_KEY == "PASTE_YOUR_API_KEY_HERE":
+        if (
+            ENABLE_CLIENT_ALLOW_DENY == 1
+            and (
+                not JELLYFIN_API_KEY
+                or JELLYFIN_API_KEY == "PASTE_YOUR_API_KEY_HERE"
+            )
+        ):
             KILL_SWITCH = 1
-            CONFIG_LOAD_ERROR = "API key missing; forced KILL_SWITCH=1"
+            CONFIG_LOAD_ERROR = (
+                "API key missing while blocking client decision is enabled; "
+                "forced KILL_SWITCH=1"
+            )
             return
 
         HDR_ALLOW_LIST = _config_rules(hdr_access["allow_list"], "allow_list")
@@ -571,9 +588,14 @@ def blocking_client_decision(argv, report):
         "session": None,
     }
 
-    if ENABLE_BLOCKING_CLIENT_DECISION != 1:
-        decision["reason"] = "ENABLE_BLOCKING_CLIENT_DECISION=0"
-        report["blocking_client_decision"].append("DISABLED: ENABLE_BLOCKING_CLIENT_DECISION=0")
+    if ENABLE_CLIENT_ALLOW_DENY != 1:
+        decision["allow_hdr_to_hdr"] = True
+        decision["reason"] = "client filtering disabled; allowing safe HDR rewrite"
+        decision["confidence"] = "not_required"
+        report["blocking_client_decision"].append(
+            "DISABLED: ENABLE_CLIENT_ALLOW_DENY=0; "
+            "allowing otherwise-safe HDR rewrite without Jellyfin API lookup"
+        )
         return decision
     if not JELLYFIN_API_KEY or JELLYFIN_API_KEY == "PASTE_YOUR_API_KEY_HERE":
         decision["reason"] = "API key missing"
@@ -1160,11 +1182,18 @@ def rewrite_intel_qsv_hdr_to_hdr(argv, report, use_filter_complex=False):
         }
         if out[index] in filter_options:
             if use_filter_complex:
-                use_opencl = ffmpeg_supports_filter("overlay_p010_bgra_opencl")
+                use_opencl = bool(
+                    ENABLE_OPENCL_SUBTITLE_COMPOSITOR == 1
+                    and ffmpeg_supports_filter("overlay_p010_bgra_opencl")
+                )
                 rewritten_filter, message = rewrite_intel_qsv_subtitle_graph(
                     out[index + 1], use_opencl_compositor=use_opencl
                 )
-                if not use_opencl:
+                if ENABLE_OPENCL_SUBTITLE_COMPOSITOR != 1:
+                    report["hdr_to_hdr"].append(
+                        "OPENCL_SUBTITLE_COMPOSITOR_DISABLED: using software fallback"
+                    )
+                elif not use_opencl:
                     report["hdr_to_hdr"].append(
                         "OPENCL_SUBTITLE_COMPOSITOR_UNAVAILABLE: using software fallback"
                     )
@@ -1507,8 +1536,9 @@ def log_report(report, original, rewritten, mode):
     log(f"  KILL_SWITCH={KILL_SWITCH}")
     log(f"  ENABLE_HDR_TO_HDR={ENABLE_HDR_TO_HDR}")
     log(f"  ENABLE_BITRATE_MIN={ENABLE_BITRATE_MIN}")
-    log(f"  ENABLE_BLOCKING_CLIENT_DECISION={ENABLE_BLOCKING_CLIENT_DECISION}")
+    log(f"  ENABLE_CLIENT_ALLOW_DENY={ENABLE_CLIENT_ALLOW_DENY}")
     log(f"  ENABLE_FILTER_COMPLEX_HDR_TO_HDR={ENABLE_FILTER_COMPLEX_HDR_TO_HDR}")
+    log(f"  ENABLE_OPENCL_SUBTITLE_COMPOSITOR={ENABLE_OPENCL_SUBTITLE_COMPOSITOR}")
     log(f"  MINRATE_RATIO={MINRATE_RATIO}")
     log(f"MODE: {mode}")
 
@@ -1555,6 +1585,7 @@ def main():
             "real_ffmpeg": REAL_FFMPEG,
             "ffprobe_binary": FFPROBE_BINARY,
             "log_file": LOG_FILE,
+            "opencl_subtitle_compositor": ENABLE_OPENCL_SUBTITLE_COMPOSITOR,
         }, indent=2, sort_keys=True))
         return
 

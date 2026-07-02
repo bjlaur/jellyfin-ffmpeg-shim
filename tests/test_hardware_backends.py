@@ -1,4 +1,8 @@
+import json
+import os
 import runpy
+import subprocess
+import tempfile
 import unittest
 
 
@@ -44,6 +48,42 @@ class HardwareBackendTests(unittest.TestCase):
         )
         self.assertEqual(info["hardware_backend"]["id"], "software")
         self.assertFalse(info["is_hw_pipeline"])
+
+    def test_disabled_client_filtering_allows_safe_rewrite_without_api(self):
+        old_value = MODULE["ENABLE_CLIENT_ALLOW_DENY"]
+        MODULE["ENABLE_CLIENT_ALLOW_DENY"] = False
+        try:
+            report = {"blocking_client_decision": []}
+            decision = MODULE["blocking_client_decision"]([], report)
+        finally:
+            MODULE["ENABLE_CLIENT_ALLOW_DENY"] = old_value
+        self.assertTrue(decision["allow_hdr_to_hdr"])
+        self.assertEqual(decision["confidence"], "not_required")
+        self.assertIn("without Jellyfin API lookup", report["blocking_client_decision"][0])
+
+    def test_config_allows_missing_api_key_when_client_filtering_is_disabled(self):
+        with open("shim.json.example", encoding="utf-8") as source:
+            config = json.load(source)
+        config["shim"]["enable_client_allow_deny"] = False
+        config["jellyfin"]["api_key"] = ""
+        config["shim"]["enable_opencl_subtitle_compositor"] = False
+        with tempfile.NamedTemporaryFile("w", encoding="utf-8") as handle:
+            json.dump(config, handle)
+            handle.flush()
+            env = os.environ.copy()
+            env["JELLYFIN_SHIM_CONFIG"] = handle.name
+            completed = subprocess.run(
+                ["python3", "jellyfin-ffmpeg-shim", "--check-config"],
+                env=env,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        state = json.loads(completed.stdout)
+        self.assertIsNone(state["config_load_error"])
+        self.assertEqual(state["kill_switch"], 0)
+        self.assertFalse(state["opencl_subtitle_compositor"])
 
     def test_unimplemented_backend_fails_closed_without_mutation(self):
         argv = [
