@@ -6,6 +6,7 @@
     "enable_client_allow_deny": true,
     "enable_filter_complex_hdr_to_hdr": true,
     "enable_opencl_subtitle_compositor": true,
+    "enable_diagnostic_overlay": false,
     "log_full_argv": true
   },
   "jellyfin": {
@@ -19,6 +20,7 @@
   },
   "tuning": {
     "minrate_ratio": 0.70,
+    "diagnostic_overlay_duration_seconds": 5.0,
     "blocking_decision_poll_delays_seconds": [0.0, 0.25, 0.75, 1.5, 2.5],
     "blocking_decision_api_timeout_seconds": 1.0,
     "source_probe_timeout_seconds": 2.0

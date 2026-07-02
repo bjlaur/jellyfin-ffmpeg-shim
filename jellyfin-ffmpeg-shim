@@ -22,6 +22,9 @@
 #       Prefer the custom OpenCL subtitle compositor. When disabled or
 #       unavailable, use the color-correct software subtitle fallback.
 #
+#   ENABLE_DIAGNOSTIC_OVERLAY = 0
+#       Burn a short diagnostic panel into supported OpenCL subtitle rewrites.
+#
 #   LOG_FULL_ARGV = 1
 #       Log original and rewritten full FFmpeg argv.
 #
@@ -55,8 +58,10 @@ ENABLE_BITRATE_MIN = False
 ENABLE_CLIENT_ALLOW_DENY = False
 ENABLE_FILTER_COMPLEX_HDR_TO_HDR = False
 ENABLE_OPENCL_SUBTITLE_COMPOSITOR = False
+ENABLE_DIAGNOSTIC_OVERLAY = False
 LOG_FULL_ARGV = False
 MINRATE_RATIO = None
+DIAGNOSTIC_OVERLAY_DURATION_SECONDS = None
 JELLYFIN_URL = None
 JELLYFIN_API_KEY = ""
 BLOCKING_DECISION_POLL_DELAYS_SECONDS = None
@@ -122,10 +127,12 @@ def load_config(path: str = CONFIG_FILE) -> None:
     global KILL_SWITCH, ENABLE_HDR_TO_HDR, ENABLE_BITRATE_MIN
     global ENABLE_CLIENT_ALLOW_DENY
     global ENABLE_FILTER_COMPLEX_HDR_TO_HDR, ENABLE_OPENCL_SUBTITLE_COMPOSITOR
+    global ENABLE_DIAGNOSTIC_OVERLAY
     global LOG_FULL_ARGV
     global JELLYFIN_URL, JELLYFIN_API_KEY
     global REAL_FFMPEG, FFPROBE_BINARY, LOG_FILE
-    global MINRATE_RATIO, BLOCKING_DECISION_POLL_DELAYS_SECONDS
+    global MINRATE_RATIO, DIAGNOSTIC_OVERLAY_DURATION_SECONDS
+    global BLOCKING_DECISION_POLL_DELAYS_SECONDS
     global BLOCKING_DECISION_API_TIMEOUT_SECONDS
     global SOURCE_PROBE_TIMEOUT_SECONDS
     global HDR_ALLOW_LIST, HDR_DENY_LIST
@@ -164,6 +171,11 @@ def load_config(path: str = CONFIG_FILE) -> None:
         ENABLE_OPENCL_SUBTITLE_COMPOSITOR = _config_bool(
             shim, "enable_opencl_subtitle_compositor"
         )
+        ENABLE_DIAGNOSTIC_OVERLAY = (
+            _config_bool(shim, "enable_diagnostic_overlay")
+            if "enable_diagnostic_overlay" in shim
+            else False
+        )
         LOG_FULL_ARGV = _config_bool(shim, "log_full_argv")
 
         JELLYFIN_URL = jellyfin["url"]
@@ -189,6 +201,14 @@ def load_config(path: str = CONFIG_FILE) -> None:
 
         MINRATE_RATIO = _config_number(
             tuning, "minrate_ratio", minimum=0.0, maximum=1.0
+        )
+        DIAGNOSTIC_OVERLAY_DURATION_SECONDS = (
+            _config_number(
+                tuning, "diagnostic_overlay_duration_seconds", minimum=0.1,
+                maximum=300.0,
+            )
+            if "diagnostic_overlay_duration_seconds" in tuning
+            else 5.0
         )
         BLOCKING_DECISION_POLL_DELAYS_SECONDS = _config_number_list(
             tuning, "blocking_decision_poll_delays_seconds"
@@ -822,7 +842,10 @@ def ffmpeg_supports_filter(filter_name: str) -> bool:
 
 
 def rewrite_intel_qsv_subtitle_graph(
-    value: str, use_opencl_compositor: bool = False
+    value: str,
+    use_opencl_compositor: bool = False,
+    diagnostic_overlay: bool = False,
+    diagnostic_duration_seconds: float = 5.0,
 ) -> tuple[str, str]:
     branches = value.split(";")
     if len(branches) != 3:
@@ -881,17 +904,57 @@ def rewrite_intel_qsv_subtitle_graph(
             return value, "BAIL: overlay_qsv branch shape was not recognized"
         options = overlay_options[1]
         options = re.sub(r":w=\d+:h=\d+(?:$|:)", "", options)
+        opencl_overlay_options = (
+            options + ":subtitle_peak=203:alpha_mode=straight"
+        )
         overlay_branch = (
             "[main_ocl][sub_ocl]overlay_p010_bgra_opencl="
-            + options
-            + ":subtitle_peak=203:alpha_mode=straight"
-            + ",hwmap=derive_device=vaapi:mode=read+write,format=vaapi"
-            + ",hwmap=derive_device=qsv,format=qsv"
+            + opencl_overlay_options
         )
-        return ";".join([subtitle_branch, main_branch, overlay_branch]), (
+        rewritten_branches = [subtitle_branch, main_branch]
+
+        if diagnostic_overlay:
+            duration = f"{diagnostic_duration_seconds:g}"
+            overlay_branch += "[subtitled_ocl]"
+            diagnostic_branch = (
+                f"color=c=black@0.65:s={output_width}x144:r=30:d={duration},"
+                "format=bgra,"
+                "drawtext=font=Sans:"
+                "text='SUCCESS\\: HDR_TO_HDR_REWRITE_APPLIED "
+                "(VAAPI/QSV SUBTITLE OVERLAY)':"
+                "fontcolor=white:fontsize=24:x=20:y=14,"
+                "drawtext=font=Sans:"
+                "text='COMPOSITOR\\: OpenCL P010/BGRA':"
+                "fontcolor=white:fontsize=20:x=20:y=58,"
+                "drawtext=font=Sans:"
+                "text='OUTPUT\\: HEVC Main10 / BT.2020 / PQ':"
+                "fontcolor=white:fontsize=20:x=20:y=92,"
+                "hwupload=derive_device=opencl[diagnostic_ocl]"
+            )
+            final_overlay_branch = (
+                "[subtitled_ocl][diagnostic_ocl]"
+                "overlay_p010_bgra_opencl=eof_action=pass:repeatlast=1:"
+                "subtitle_peak=203:alpha_mode=straight"
+                ",hwmap=derive_device=vaapi:mode=read+write,format=vaapi"
+                ",hwmap=derive_device=qsv,format=qsv"
+            )
+            rewritten_branches.extend(
+                [overlay_branch, diagnostic_branch, final_overlay_branch]
+            )
+        else:
+            overlay_branch += (
+                ",hwmap=derive_device=vaapi:mode=read+write,format=vaapi"
+                ",hwmap=derive_device=qsv,format=qsv"
+            )
+            rewritten_branches.append(overlay_branch)
+
+        message = (
             "converted P010/BGRA subtitle overlay to the GPU OpenCL compositor "
-            f"at {output_width}x{output_height}; {main_message}"
+            f"at {output_width}x{output_height}"
         )
+        if diagnostic_overlay:
+            message += f" with {duration}s diagnostic burn-in"
+        return ";".join(rewritten_branches), f"{message}; {main_message}"
 
     main_branch, download_count = re.subn(
         r",hwmap=derive_device=qsv,format=qsv\[main\]$",
@@ -1186,8 +1249,17 @@ def rewrite_intel_qsv_hdr_to_hdr(argv, report, use_filter_complex=False):
                     ENABLE_OPENCL_SUBTITLE_COMPOSITOR == 1
                     and ffmpeg_supports_filter("overlay_p010_bgra_opencl")
                 )
+                use_diagnostic_overlay = bool(
+                    ENABLE_DIAGNOSTIC_OVERLAY == 1
+                    and use_opencl
+                    and ffmpeg_supports_filter("drawtext")
+                    and ffmpeg_supports_filter("color")
+                )
                 rewritten_filter, message = rewrite_intel_qsv_subtitle_graph(
-                    out[index + 1], use_opencl_compositor=use_opencl
+                    out[index + 1],
+                    use_opencl_compositor=use_opencl,
+                    diagnostic_overlay=use_diagnostic_overlay,
+                    diagnostic_duration_seconds=DIAGNOSTIC_OVERLAY_DURATION_SECONDS,
                 )
                 if ENABLE_OPENCL_SUBTITLE_COMPOSITOR != 1:
                     report["hdr_to_hdr"].append(
@@ -1197,6 +1269,16 @@ def rewrite_intel_qsv_hdr_to_hdr(argv, report, use_filter_complex=False):
                     report["hdr_to_hdr"].append(
                         "OPENCL_SUBTITLE_COMPOSITOR_UNAVAILABLE: using software fallback"
                     )
+                if ENABLE_DIAGNOSTIC_OVERLAY == 1:
+                    if use_diagnostic_overlay:
+                        report["hdr_to_hdr"].append(
+                            "DIAGNOSTIC_OVERLAY_ENABLED: burning rewrite status into output"
+                        )
+                    else:
+                        report["hdr_to_hdr"].append(
+                            "DIAGNOSTIC_OVERLAY_UNAVAILABLE: requires OpenCL compositor, "
+                            "drawtext, and color filters"
+                        )
             else:
                 rewritten_filter, message = replace_vaapi_tonemap_with_hdr(out[index + 1])
             if rewritten_filter == out[index + 1]:
@@ -1539,6 +1621,11 @@ def log_report(report, original, rewritten, mode):
     log(f"  ENABLE_CLIENT_ALLOW_DENY={ENABLE_CLIENT_ALLOW_DENY}")
     log(f"  ENABLE_FILTER_COMPLEX_HDR_TO_HDR={ENABLE_FILTER_COMPLEX_HDR_TO_HDR}")
     log(f"  ENABLE_OPENCL_SUBTITLE_COMPOSITOR={ENABLE_OPENCL_SUBTITLE_COMPOSITOR}")
+    log(f"  ENABLE_DIAGNOSTIC_OVERLAY={ENABLE_DIAGNOSTIC_OVERLAY}")
+    log(
+        "  DIAGNOSTIC_OVERLAY_DURATION_SECONDS="
+        f"{DIAGNOSTIC_OVERLAY_DURATION_SECONDS}"
+    )
     log(f"  MINRATE_RATIO={MINRATE_RATIO}")
     log(f"MODE: {mode}")
 
@@ -1586,6 +1673,10 @@ def main():
             "ffprobe_binary": FFPROBE_BINARY,
             "log_file": LOG_FILE,
             "opencl_subtitle_compositor": ENABLE_OPENCL_SUBTITLE_COMPOSITOR,
+            "diagnostic_overlay": ENABLE_DIAGNOSTIC_OVERLAY,
+            "diagnostic_overlay_duration_seconds": (
+                DIAGNOSTIC_OVERLAY_DURATION_SECONDS
+            ),
         }, indent=2, sort_keys=True))
         return
 

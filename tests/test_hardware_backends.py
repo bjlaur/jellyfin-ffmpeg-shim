@@ -50,13 +50,14 @@ class HardwareBackendTests(unittest.TestCase):
         self.assertFalse(info["is_hw_pipeline"])
 
     def test_disabled_client_filtering_allows_safe_rewrite_without_api(self):
-        old_value = MODULE["ENABLE_CLIENT_ALLOW_DENY"]
-        MODULE["ENABLE_CLIENT_ALLOW_DENY"] = False
+        function_globals = MODULE["blocking_client_decision"].__globals__
+        old_value = function_globals["ENABLE_CLIENT_ALLOW_DENY"]
+        function_globals["ENABLE_CLIENT_ALLOW_DENY"] = False
         try:
             report = {"blocking_client_decision": []}
             decision = MODULE["blocking_client_decision"]([], report)
         finally:
-            MODULE["ENABLE_CLIENT_ALLOW_DENY"] = old_value
+            function_globals["ENABLE_CLIENT_ALLOW_DENY"] = old_value
         self.assertTrue(decision["allow_hdr_to_hdr"])
         self.assertEqual(decision["confidence"], "not_required")
         self.assertIn("without Jellyfin API lookup", report["blocking_client_decision"][0])
@@ -84,6 +85,33 @@ class HardwareBackendTests(unittest.TestCase):
         self.assertIsNone(state["config_load_error"])
         self.assertEqual(state["kill_switch"], 0)
         self.assertFalse(state["opencl_subtitle_compositor"])
+        self.assertFalse(state["diagnostic_overlay"])
+        self.assertEqual(state["diagnostic_overlay_duration_seconds"], 5.0)
+
+    def test_existing_config_defaults_diagnostic_overlay_to_disabled(self):
+        with open("shim.json.example", encoding="utf-8") as source:
+            config = json.load(source)
+        config["shim"]["enable_client_allow_deny"] = False
+        config["jellyfin"]["api_key"] = ""
+        del config["shim"]["enable_diagnostic_overlay"]
+        del config["tuning"]["diagnostic_overlay_duration_seconds"]
+        with tempfile.NamedTemporaryFile("w", encoding="utf-8") as handle:
+            json.dump(config, handle)
+            handle.flush()
+            env = os.environ.copy()
+            env["JELLYFIN_SHIM_CONFIG"] = handle.name
+            completed = subprocess.run(
+                ["python3", "jellyfin-ffmpeg-shim", "--check-config"],
+                env=env,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        state = json.loads(completed.stdout)
+        self.assertIsNone(state["config_load_error"])
+        self.assertFalse(state["diagnostic_overlay"])
+        self.assertEqual(state["diagnostic_overlay_duration_seconds"], 5.0)
 
     def test_unimplemented_backend_fails_closed_without_mutation(self):
         argv = [
@@ -210,6 +238,38 @@ class HardwareBackendTests(unittest.TestCase):
         self.assertIn("hwmap=derive_device=qsv,format=qsv", rewritten)
         self.assertNotIn("hwdownload", rewritten)
         self.assertIn("extra_hw_frames=27", rewritten)
+
+    def test_opencl_subtitle_rewrite_can_burn_diagnostic_overlay(self):
+        graph = (
+            "[0:7]scale,scale=1920:1080:fast_bilinear,format=bgra,"
+            "hwupload=derive_device=qsv:extra_hw_frames=27[sub];"
+            "[0:0]setparams=color_primaries=bt2020:color_trc=smpte2084:"
+            "colorspace=bt2020nc,procamp_vaapi=b=16,"
+            "tonemap_vaapi=format=nv12:p=bt709:t=bt709:m=bt709:"
+            "extra_hw_frames=19,hwmap=derive_device=qsv,format=qsv[main];"
+            "[main][sub]overlay_qsv=eof_action=pass:repeatlast=0:"
+            "w=3840:h=2160"
+        )
+        rewritten, message = MODULE["rewrite_intel_qsv_subtitle_graph"](
+            graph,
+            use_opencl_compositor=True,
+            diagnostic_overlay=True,
+            diagnostic_duration_seconds=5.0,
+        )
+        self.assertNotIn("BAIL:", message)
+        self.assertIn("5s diagnostic burn-in", message)
+        self.assertIn("color=c=black@0.65:s=3840x144:r=30:d=5", rewritten)
+        self.assertIn(
+            "SUCCESS\\: HDR_TO_HDR_REWRITE_APPLIED "
+            "(VAAPI/QSV SUBTITLE OVERLAY)",
+            rewritten,
+        )
+        self.assertIn("COMPOSITOR\\: OpenCL P010/BGRA", rewritten)
+        self.assertIn("OUTPUT\\: HEVC Main10 / BT.2020 / PQ", rewritten)
+        self.assertEqual(rewritten.count("overlay_p010_bgra_opencl="), 2)
+        self.assertIn("[subtitled_ocl][diagnostic_ocl]", rewritten)
+        self.assertEqual(rewritten.count("hwmap=derive_device=vaapi"), 1)
+        self.assertNotIn("hwdownload", rewritten)
 
 
 if __name__ == "__main__":
