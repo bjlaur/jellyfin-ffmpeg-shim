@@ -4,10 +4,12 @@
 video WITHOUT tone-mapping it to SDR.  Keep that beautiful HDR goodness even
 when your bandwidth is not quite there.
 
-It has only been tested on my Intel UHD Graphics 630 (Comet Lake GT2), using
-the Intel `iHD` VAAPI driver, Intel OpenCL, and QSV HEVC Main10 encoding.  It
-may work on other Intel systems, but they are untested.  It will not currently
-perform HDR rewrites with NVIDIA, AMD, or other hardware backends.
+It was developed and tested against Jellyfin 10.11.11 on my Intel UHD Graphics
+630 (Comet Lake GT2), using the Intel `iHD` VAAPI driver, Intel OpenCL, and QSV
+HEVC Main10 encoding.  Playback was tested with Jellyfin Android TV 0.19.9 and
+Jellyfin Web 10.11.11.  It may work with other Jellyfin versions and Intel
+systems, but they are untested.  It will not currently perform HDR rewrites
+with NVIDIA, AMD, or other hardware backends.
 
 The purpose of this project is the following:
 
@@ -21,6 +23,12 @@ The purpose of this project is the following:
    can document the FFmpeg filter graphs and hardware pipelines required for
    each platform, it may make it easier for Jellyfin to implement this
    upstream.
+
+This project is an experimental proof of concept.  It is implemented as a shim
+so the functionality can be dropped into an existing installation without
+requiring an experimental, hardware-specific fork of Jellyfin itself.  It is
+not feature-complete and does not support every HDR format or hardware
+pipeline.  YMMV.
 
 ## What it does
 
@@ -81,13 +89,15 @@ and build script are in `docs/`.
 
 ## Supported hardware and formats
 
-The implemented hardware paths target the pipeline Jellyfin emitted on the
-development system: Intel UHD Graphics 630, Intel `iHD`, VAAPI
-decode/filtering, Intel OpenCL, and QSV Main10 encoding.  The code does not
-hardcode that model, render node, PCI ID, or GPU generation, but that does not
-mean other Intel hardware has been validated.  The shim recognizes command
-shape and capabilities; its accelerated behavior has only been tested on the
-hardware and software stack above.
+The implemented hardware paths were developed and tested against Jellyfin
+10.11.11 and the pipeline it emitted on the development system: Intel UHD
+Graphics 630, Intel `iHD`, VAAPI decode/filtering, Intel OpenCL, and QSV Main10
+encoding.  Playback was exercised through Jellyfin Android TV 0.19.9 and
+Jellyfin Web 10.11.11.  The code does not hardcode that model, render node, PCI
+ID, or GPU generation, but that does not mean other Intel hardware or Jellyfin
+versions have been tested.  The shim recognizes command shape and
+capabilities; its accelerated behavior has only been tested on the hardware
+and software stack above.
 
 Implemented source behavior includes:
 
@@ -106,14 +116,12 @@ behavior.  Porting notes are maintained in `.agentic/handoff.md`.
 - Jellyfin and a working jellyfin-ffmpeg installation.
 - `ffprobe` from the same jellyfin-ffmpeg build.
 - A Jellyfin API key only when `enable_client_allow_deny` is `true`.
-- For the currently implemented accelerated paths: the tested Intel UHD 630
-  VAAPI/Intel OpenCL/QSV stack, or another configuration that has been
-  independently verified to provide equivalent interoperability.
 - For accelerated HDR subtitle composition: a jellyfin-ffmpeg build containing
   `overlay_p010_bgra_opencl`.
 
-The tested jellyfin-ffmpeg 8.1.2 source, including the custom OpenCL compositor,
-is maintained at [bjlaur/jellyfin-ffmpeg](https://github.com/bjlaur/jellyfin-ffmpeg).
+The jellyfin-ffmpeg 8.1.2 source developed and tested with Jellyfin 10.11.11,
+including the custom OpenCL compositor, is maintained at
+[bjlaur/jellyfin-ffmpeg](https://github.com/bjlaur/jellyfin-ffmpeg).
 
 The custom compositor is optional.  When it is absent, supported subtitle
 rewrites use the software compositor fallback.
@@ -379,10 +387,10 @@ subtitle overlay, preserve the original video.
 
 The critical implementation constraint is surface ownership.  Allocating a
 new OpenCL output frame produced a device-only surface that could not be mapped
-back into the VAAPI/QSV pipeline on the tested Intel stack.  The filter instead
-clones the mapped main frame, retains its hardware-frame context, and composites
-onto that mapped surface.  The shim therefore requests read/write access in
-both mapping directions:
+back into the VAAPI/QSV pipeline on the Intel stack developed and tested
+against Jellyfin 10.11.11.  The filter instead clones the mapped main frame,
+retains its hardware-frame context, and composites onto that mapped surface.
+The shim therefore requests read/write access in both mapping directions:
 
 ```text
 VAAPI P010

@@ -462,7 +462,10 @@ No luminance tonemapping is intended. The goal is transcoding/resizing while pre
 
 ## Hardware VAAPI/QSV HDR-preserving rewrite
 
-The supported hardware pipeline is intentionally narrow and matches Jellyfin's observed Intel command:
+The supported hardware pipeline is intentionally narrow and was developed and
+tested against Jellyfin 10.11.11.  Playback was exercised through Jellyfin
+Android TV 0.19.9 and Jellyfin Web 10.11.11.  It matches that server version's
+observed Intel command:
 
 ```text
 -init_hw_device vaapi=va:,vendor_id=0x8086,driver=iHD
@@ -642,7 +645,12 @@ Do not perform regex surgery on arbitrary overlay graphs without explicit tests.
 
 ### Other hardware pipelines
 
-Only the observed Intel VAAPI-to-QSV graph is supported. Unsupported hardware encoders/filter graphs fail closed and preserve Jellyfin behavior.
+Only the Intel VAAPI-to-QSV graph developed and tested against Jellyfin 10.11.11
+is supported.  Unsupported hardware encoders and filter graphs fail closed and
+preserve Jellyfin behavior.  Other server versions have not been tested and
+may emit different graphs that pass through unchanged.  Jellyfin Android TV
+0.19.9 and Jellyfin Web 10.11.11 were used for playback testing, not treated
+as an exhaustive client compatibility matrix.
 
 Examples requiring separate implementation/testing:
 
