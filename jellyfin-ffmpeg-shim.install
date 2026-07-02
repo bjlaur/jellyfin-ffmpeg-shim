@@ -10,7 +10,8 @@ post_install() {
   echo '************************************************************************'
   echo 'The following must be done before jellyfin-ffmpeg-shim will be activated:'
   echo
-  echo '  - Edit /etc/jellyfin/shim.json and set your Jellyfin API key and HDR access rules.'
+  echo '  - Edit /etc/jellyfin/shim.json and configure the HDR access rules.'
+  echo '    An API key is required only when client allow/deny filtering is enabled.'
   echo '  - Configure Jellyfin to use /usr/local/bin/jellyfin-ffmpeg-shim as FFmpeg.'
   echo '    Check /etc/jellyfin/jellyfin.env for the active FFmpeg setting.'
   echo
