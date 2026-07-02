@@ -609,7 +609,14 @@ If using ffprobe:
 
 ### `-filter_complex`
 
-Subtitle burn-in/overlay graphs generally use `-filter_complex`. They remain unsupported.
+Subtitle burn-in/overlay graphs use `-filter_complex`.  The Intel QSV path is
+supported.  The shim now prefers the custom `overlay_p010_bgra_opencl` filter
+when the configured FFmpeg binary advertises it.  The proven path maps the
+P010 main surface into OpenCL with `mode=read+write`, composites in place, maps
+back through explicit VAAPI (`format=vaapi`), then derives QSV for Main10
+encode.  There is no full-frame CPU download/upload in this path.  If the
+custom filter is absent, the existing color-correct software compositor is
+used as a fallback.
 
 Expected behavior:
 

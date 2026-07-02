@@ -149,6 +149,28 @@ class HardwareBackendTests(unittest.TestCase):
         self.assertIn("scale_vaapi=format=p010", rewritten)
         self.assertIn("extra_hw_frames=19", rewritten)
 
+    def test_subtitle_rewrite_uses_opencl_compositor_when_available(self):
+        graph = (
+            "[0:7]scale,scale=1920:1080:fast_bilinear,format=bgra,"
+            "hwupload=derive_device=qsv:extra_hw_frames=27[sub];"
+            "[0:0]setparams=color_primaries=bt2020:color_trc=smpte2084:"
+            "colorspace=bt2020nc,procamp_vaapi=b=16,"
+            "tonemap_vaapi=format=nv12:p=bt709:t=bt709:m=bt709:"
+            "extra_hw_frames=19,hwmap=derive_device=qsv,format=qsv[main];"
+            "[main][sub]overlay_qsv=eof_action=pass:repeatlast=0:"
+            "w=3840:h=2160"
+        )
+        rewritten, message = MODULE["rewrite_intel_qsv_subtitle_graph"](
+            graph, use_opencl_compositor=True
+        )
+        self.assertNotIn("BAIL:", message)
+        self.assertIn("overlay_p010_bgra_opencl=", rewritten)
+        self.assertIn("hwmap=derive_device=opencl:mode=read+write", rewritten)
+        self.assertIn("hwmap=derive_device=vaapi:mode=read+write,format=vaapi", rewritten)
+        self.assertIn("hwmap=derive_device=qsv,format=qsv", rewritten)
+        self.assertNotIn("hwdownload", rewritten)
+        self.assertIn("extra_hw_frames=27", rewritten)
+
 
 if __name__ == "__main__":
     unittest.main()

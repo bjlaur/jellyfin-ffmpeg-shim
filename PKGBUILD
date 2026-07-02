@@ -1,6 +1,6 @@
 pkgname=jellyfin-ffmpeg-shim
 pkgver=0.1.0
-pkgrel=17
+pkgrel=18
 pkgdesc='Jellyfin FFmpeg shim for selective HDR-to-HDR transcoding'
 arch=('any')
 url=''

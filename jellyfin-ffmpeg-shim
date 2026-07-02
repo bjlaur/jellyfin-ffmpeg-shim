@@ -783,7 +783,25 @@ def replace_vaapi_tonemap_with_hdr(value: str) -> tuple[str, str]:
     )
 
 
-def rewrite_intel_qsv_subtitle_graph(value: str) -> tuple[str, str]:
+def ffmpeg_supports_filter(filter_name: str) -> bool:
+    try:
+        completed = subprocess.run(
+            [REAL_FFMPEG, "-hide_banner", "-filters"],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            timeout=2.0,
+            check=False,
+        )
+    except Exception:
+        return False
+    return completed.returncode == 0 and filter_name in completed.stdout
+
+
+def rewrite_intel_qsv_subtitle_graph(
+    value: str, use_opencl_compositor: bool = False
+) -> tuple[str, str]:
     branches = value.split(";")
     if len(branches) != 3:
         return value, f"BAIL: expected exactly three filter branches, found {len(branches)}"
@@ -820,6 +838,38 @@ def rewrite_intel_qsv_subtitle_graph(value: str) -> tuple[str, str]:
     )
     if scale_count != 1:
         return value, f"BAIL: expected one subtitle scale filter, found {scale_count}"
+
+    if use_opencl_compositor:
+        subtitle_branch = subtitle_branch.removesuffix("[sub]")
+        subtitle_branch += (
+            ",hwupload=derive_device=opencl"
+            + subtitle_upload_options
+            + "[sub_ocl]"
+        )
+        main_branch, map_count = re.subn(
+            r",hwmap=derive_device=qsv,format=qsv\[main\]$",
+            ",hwmap=derive_device=opencl:mode=read+write[main_ocl]",
+            main_branch,
+        )
+        if map_count != 1:
+            return value, f"BAIL: expected one VAAPI-to-QSV main mapping, found {map_count}"
+
+        overlay_options = overlay_branch.split("overlay_qsv=", 1)
+        if len(overlay_options) != 2 or not overlay_options[0].endswith("[main][sub]"):
+            return value, "BAIL: overlay_qsv branch shape was not recognized"
+        options = overlay_options[1]
+        options = re.sub(r":w=\d+:h=\d+(?:$|:)", "", options)
+        overlay_branch = (
+            "[main_ocl][sub_ocl]overlay_p010_bgra_opencl="
+            + options
+            + ":subtitle_peak=203:alpha_mode=straight"
+            + ",hwmap=derive_device=vaapi:mode=read+write,format=vaapi"
+            + ",hwmap=derive_device=qsv,format=qsv"
+        )
+        return ";".join([subtitle_branch, main_branch, overlay_branch]), (
+            "converted P010/BGRA subtitle overlay to the GPU OpenCL compositor "
+            f"at {output_width}x{output_height}; {main_message}"
+        )
 
     main_branch, download_count = re.subn(
         r",hwmap=derive_device=qsv,format=qsv\[main\]$",
@@ -1110,7 +1160,14 @@ def rewrite_intel_qsv_hdr_to_hdr(argv, report, use_filter_complex=False):
         }
         if out[index] in filter_options:
             if use_filter_complex:
-                rewritten_filter, message = rewrite_intel_qsv_subtitle_graph(out[index + 1])
+                use_opencl = ffmpeg_supports_filter("overlay_p010_bgra_opencl")
+                rewritten_filter, message = rewrite_intel_qsv_subtitle_graph(
+                    out[index + 1], use_opencl_compositor=use_opencl
+                )
+                if not use_opencl:
+                    report["hdr_to_hdr"].append(
+                        "OPENCL_SUBTITLE_COMPOSITOR_UNAVAILABLE: using software fallback"
+                    )
             else:
                 rewritten_filter, message = replace_vaapi_tonemap_with_hdr(out[index + 1])
             if rewritten_filter == out[index + 1]:
