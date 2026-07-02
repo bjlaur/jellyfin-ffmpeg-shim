@@ -338,6 +338,9 @@ playback is rejected; Jellyfin may still perform its original SDR tone map.
 
 ## Development
 
+If you are experimenting with a new hardware backend, start with the
+[developer getting-started workflow](how-to-get-started.md).
+
 Run the regression tests with:
 
 ```bash
