@@ -70,6 +70,11 @@ if (Recognized HDR rewrite graph?) then (yes)
     endif
   endif
 
+  if (Diagnostic overlay enabled?) then (yes)
+    :Burn path, compositor, and HDR output status
+    for the configured duration;
+  endif
+
   :Force defensible output signaling:
   HEVC Main10, limited range,
   BT.2020 matrix/primaries, PQ transfer;

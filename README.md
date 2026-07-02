@@ -223,9 +223,9 @@ Important configuration controls:
 - `enable_opencl_subtitle_compositor`: uses the custom GPU subtitle compositor
   when available.  Set it to `false` to force the slower software subtitle
   fallback without disabling HDR subtitle burn-in entirely.
-- `enable_diagnostic_overlay`: burns a five-second status panel into supported
-  OpenCL subtitle rewrites.  It is disabled by default and is intended for
-  confirming the active playback path without opening the shim log.
+- `enable_diagnostic_overlay`: burns a 15-second status panel into supported
+  HDR rewrites.  It is disabled by default and is intended for confirming the
+  active playback path without opening the shim log.
 - `log_full_argv`: logs full original and rewritten commands; these can contain
   media paths.
 - `minrate_ratio`: fraction of `-maxrate` used for `-minrate`.
@@ -399,12 +399,21 @@ deriving the QSV view; omitting it caused the reverse map to fail with
 the output dimensions as BGRA and uploaded directly to the OpenCL device.
 
 When the diagnostic overlay is enabled, `color` and `drawtext` create a shallow
-BGRA status panel for the configured duration.  That small panel is uploaded to
-OpenCL and blended with a second `overlay_p010_bgra_opencl` pass before the
+BGRA status panel for the configured duration.  Hardware rewrites upload only
+that panel to OpenCL and blend it with `overlay_p010_bgra_opencl` before the
 frame returns to VAAPI/QSV.  Text rendering occurs in software, but the P010
 video is never downloaded; only the diagnostic panel crosses from system
-memory to the GPU.  The panel reports the successful subtitle rewrite,
-compositor path, and HDR output signaling.
+memory to the GPU.  The panel reports the successful rewrite, active path, and
+HDR output signaling.
+
+For ordinary HDR10 and Dolby Vision Profile 5 rewrites, the shim promotes
+Jellyfin's simple video filter into a two-branch complex graph.  The rewritten
+P010 video remains in OpenCL on one branch while the small diagnostic panel is
+rendered and uploaded on the other.  The compositor output maps back through
+VAAPI to QSV Main10.  Subtitle burn-in uses the same idea but adds the panel as
+a second compositor pass after the subtitle pass.  Software libx265 rewrites
+use `drawtext` directly because those video frames already reside in system
+memory.
 
 The shim uses this path only when it recognizes the exact three-branch QSV
 subtitle graph and the configured jellyfin-ffmpeg binary advertises the custom

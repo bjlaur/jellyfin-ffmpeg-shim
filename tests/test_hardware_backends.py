@@ -86,7 +86,7 @@ class HardwareBackendTests(unittest.TestCase):
         self.assertEqual(state["kill_switch"], 0)
         self.assertFalse(state["opencl_subtitle_compositor"])
         self.assertFalse(state["diagnostic_overlay"])
-        self.assertEqual(state["diagnostic_overlay_duration_seconds"], 5.0)
+        self.assertEqual(state["diagnostic_overlay_duration_seconds"], 15.0)
 
     def test_existing_config_defaults_diagnostic_overlay_to_disabled(self):
         with open("shim.json.example", encoding="utf-8") as source:
@@ -111,7 +111,7 @@ class HardwareBackendTests(unittest.TestCase):
         state = json.loads(completed.stdout)
         self.assertIsNone(state["config_load_error"])
         self.assertFalse(state["diagnostic_overlay"])
-        self.assertEqual(state["diagnostic_overlay_duration_seconds"], 5.0)
+        self.assertEqual(state["diagnostic_overlay_duration_seconds"], 15.0)
 
     def test_unimplemented_backend_fails_closed_without_mutation(self):
         argv = [
@@ -254,11 +254,11 @@ class HardwareBackendTests(unittest.TestCase):
             graph,
             use_opencl_compositor=True,
             diagnostic_overlay=True,
-            diagnostic_duration_seconds=5.0,
+            diagnostic_duration_seconds=15.0,
         )
         self.assertNotIn("BAIL:", message)
-        self.assertIn("5s diagnostic burn-in", message)
-        self.assertIn("color=c=black@0.65:s=3840x144:r=30:d=5", rewritten)
+        self.assertIn("15s diagnostic burn-in", message)
+        self.assertIn("color=c=black@0.65:s=3840x144:r=30:d=15", rewritten)
         self.assertIn(
             "SUCCESS\\: HDR_TO_HDR_REWRITE_APPLIED "
             "(VAAPI/QSV SUBTITLE OVERLAY)",
@@ -268,6 +268,7 @@ class HardwareBackendTests(unittest.TestCase):
         self.assertIn("OUTPUT\\: HEVC Main10 / BT.2020 / PQ", rewritten)
         self.assertEqual(rewritten.count("overlay_p010_bgra_opencl="), 2)
         self.assertIn("[subtitled_ocl][diagnostic_ocl]", rewritten)
+        self.assertIn("x=0:y=216:subtitle_peak=203", rewritten)
         self.assertEqual(rewritten.count("hwmap=derive_device=vaapi"), 1)
         self.assertNotIn("hwdownload", rewritten)
 

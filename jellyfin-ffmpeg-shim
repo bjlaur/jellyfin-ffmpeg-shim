@@ -23,7 +23,7 @@
 #       unavailable, use the color-correct software subtitle fallback.
 #
 #   ENABLE_DIAGNOSTIC_OVERLAY = 0
-#       Burn a short diagnostic panel into supported OpenCL subtitle rewrites.
+#       Burn a short diagnostic panel into supported HDR rewrites.
 #
 #   LOG_FULL_ARGV = 1
 #       Log original and rewritten full FFmpeg argv.
@@ -208,7 +208,7 @@ def load_config(path: str = CONFIG_FILE) -> None:
                 maximum=300.0,
             )
             if "diagnostic_overlay_duration_seconds" in tuning
-            else 5.0
+            else 15.0
         )
         BLOCKING_DECISION_POLL_DELAYS_SECONDS = _config_number_list(
             tuning, "blocking_decision_poll_delays_seconds"
@@ -383,7 +383,7 @@ def probe_source_hdr_compatibility(argv, report):
         "-v", "error",
         "-select_streams", "v:0",
         "-show_entries",
-        "stream=codec_name,profile,pix_fmt,color_range,color_space,color_transfer,color_primaries:stream_side_data",
+        "stream=codec_name,profile,width,height,pix_fmt,color_range,color_space,color_transfer,color_primaries:stream_side_data",
         "-of", "json",
         input_path,
     ]
@@ -433,6 +433,8 @@ def probe_source_hdr_compatibility(argv, report):
     summary = {
         "codec_name": stream.get("codec_name"),
         "profile": stream.get("profile"),
+        "width": stream.get("width"),
+        "height": stream.get("height"),
         "pix_fmt": stream.get("pix_fmt"),
         "color_range": stream.get("color_range"),
         "color_space": stream.get("color_space"),
@@ -841,11 +843,128 @@ def ffmpeg_supports_filter(filter_name: str) -> bool:
     return completed.returncode == 0 and filter_name in completed.stdout
 
 
+def diagnostic_drawtext_chain(success_text: str) -> str:
+    duration = f"{DIAGNOSTIC_OVERLAY_DURATION_SECONDS:g}"
+    escaped_success = success_text.replace("\\", "\\\\").replace(":", "\\:")
+    common = (
+        "font=Sans:fontcolor=white:box=1:boxcolor=black@0.65:"
+        "boxborderw=10:x=20:enable='lt(t\\," + duration + ")'"
+    )
+    return ",".join([
+        f"drawtext={common}:text='{escaped_success}':fontsize=24:y=h*0.10",
+        "drawtext=" + common
+        + ":text='COMPOSITOR\\: software diagnostic stage':fontsize=20:y=h*0.10+44",
+        "drawtext=" + common
+        + ":text='OUTPUT\\: HEVC Main10 / BT.2020 / PQ':fontsize=20:y=h*0.10+82",
+    ])
+
+
+def diagnostic_overlay_filters_available() -> bool:
+    return all(ffmpeg_supports_filter(name) for name in (
+        "drawtext", "color", "overlay_p010_bgra_opencl",
+    ))
+
+
+def diagnostic_output_dimensions(argv, filter_value, source_decision):
+    matches = re.findall(r"scale_vaapi=w=(\d+):h=(\d+)", filter_value)
+    if matches:
+        return tuple(map(int, matches[-1]))
+
+    for index in range(len(argv) - 1):
+        if argv[index] in {"-s", "-s:v", "-s:v:0"}:
+            match = re.fullmatch(r"(\d+)x(\d+)", argv[index + 1])
+            if match:
+                return tuple(map(int, match.groups()))
+
+    summary = source_decision.get("summary") or {}
+    width, height = summary.get("width"), summary.get("height")
+    if isinstance(width, int) and width > 0 and isinstance(height, int) and height > 0:
+        return width, height
+    return 1920, 1080
+
+
+def opencl_diagnostic_panel_branch(width, success_text, duration):
+    escaped_success = success_text.replace("\\", "\\\\").replace(":", "\\:")
+    return (
+        f"color=c=black@0.65:s={width}x144:r=30:d={duration},format=bgra,"
+        "drawtext=font=Sans:"
+        f"text='{escaped_success}':"
+        "fontcolor=white:fontsize=24:x=20:y=14,"
+        "drawtext=font=Sans:"
+        "text='COMPOSITOR\\: OpenCL P010/BGRA':"
+        "fontcolor=white:fontsize=20:x=20:y=58,"
+        "drawtext=font=Sans:"
+        "text='OUTPUT\\: HEVC Main10 / BT.2020 / PQ':"
+        "fontcolor=white:fontsize=20:x=20:y=92,"
+        "hwupload=derive_device=opencl[diagnostic_ocl]"
+    )
+
+
+def promote_qsv_filter_to_opencl_diagnostic(
+    argv, filter_index, filter_value, success_text, source_decision, *, dovi=False
+):
+    out = argv[:]
+    width, height = diagnostic_output_dimensions(out, filter_value, source_decision)
+    duration = f"{DIAGNOSTIC_OVERLAY_DURATION_SECONDS:g}"
+    diagnostic_y = round(height * 0.10)
+
+    video_map_index = None
+    video_input = None
+    for index in range(len(out) - 1):
+        if out[index] == "-map" and re.fullmatch(r"\d+:\d+", out[index + 1]):
+            video_map_index = index + 1
+            video_input = out[index + 1]
+            break
+    if video_map_index is None:
+        return argv, "BAIL: diagnostic overlay could not identify the mapped video input"
+
+    if dovi:
+        main_filter = filter_value.replace(
+            "hwmap=derive_device=opencl:mode=read,",
+            "hwmap=derive_device=opencl:mode=read+write,",
+            1,
+        )
+        main_filter, count = re.subn(
+            r",hwmap=derive_device=qsv:mode=write:reverse=1"
+            r"(?::extra_hw_frames=\d+)?,format=qsv$",
+            "[diagnostic_main]",
+            main_filter,
+            count=1,
+        )
+    else:
+        main_filter, count = re.subn(
+            r",hwmap=derive_device=qsv,format=qsv$",
+            ",hwmap=derive_device=opencl:mode=read+write[diagnostic_main]",
+            filter_value,
+            count=1,
+        )
+    if count != 1:
+        return argv, "BAIL: diagnostic overlay could not retain the P010 main frame in OpenCL"
+
+    panel = opencl_diagnostic_panel_branch(width, success_text, duration)
+    composite = (
+        "[diagnostic_main][diagnostic_ocl]"
+        "overlay_p010_bgra_opencl=eof_action=pass:repeatlast=1:"
+        f"x=0:y={diagnostic_y}:subtitle_peak=203:alpha_mode=straight,"
+        "hwmap=derive_device=vaapi:mode=read+write,format=vaapi,"
+        "hwmap=derive_device=qsv,format=qsv[diagnostic_out]"
+    )
+    out[filter_index] = "-filter_complex"
+    out[filter_index + 1] = (
+        f"[{video_input}]{main_filter};{panel};{composite}"
+    )
+    out[video_map_index] = "[diagnostic_out]"
+    return out, (
+        f"added zero-copy OpenCL diagnostic overlay at {width}x{height} "
+        f"for {duration}s"
+    )
+
+
 def rewrite_intel_qsv_subtitle_graph(
     value: str,
     use_opencl_compositor: bool = False,
     diagnostic_overlay: bool = False,
-    diagnostic_duration_seconds: float = 5.0,
+    diagnostic_duration_seconds: float = 15.0,
 ) -> tuple[str, str]:
     branches = value.split(";")
     if len(branches) != 3:
@@ -915,6 +1034,7 @@ def rewrite_intel_qsv_subtitle_graph(
 
         if diagnostic_overlay:
             duration = f"{diagnostic_duration_seconds:g}"
+            diagnostic_y = round(int(output_height) * 0.10)
             overlay_branch += "[subtitled_ocl]"
             diagnostic_branch = (
                 f"color=c=black@0.65:s={output_width}x144:r=30:d={duration},"
@@ -934,7 +1054,7 @@ def rewrite_intel_qsv_subtitle_graph(
             final_overlay_branch = (
                 "[subtitled_ocl][diagnostic_ocl]"
                 "overlay_p010_bgra_opencl=eof_action=pass:repeatlast=1:"
-                "subtitle_peak=203:alpha_mode=straight"
+                f"x=0:y={diagnostic_y}:subtitle_peak=203:alpha_mode=straight"
                 ",hwmap=derive_device=vaapi:mode=read+write,format=vaapi"
                 ",hwmap=derive_device=qsv,format=qsv"
             )
@@ -1235,9 +1355,12 @@ def classify_command(argv):
     }
 
 
-def rewrite_intel_qsv_hdr_to_hdr(argv, report, use_filter_complex=False):
+def rewrite_intel_qsv_hdr_to_hdr(
+    argv, report, source_decision, use_filter_complex=False
+):
     out = argv[:]
     changed_filter = False
+    rewritten_filter_index = None
 
     for index in range(len(out) - 1):
         filter_options = {"-filter_complex"} if use_filter_complex else {
@@ -1285,6 +1408,7 @@ def rewrite_intel_qsv_hdr_to_hdr(argv, report, use_filter_complex=False):
                 report["hdr_to_hdr"].append(f"BAIL: hardware filter rewrite failed: {message}")
                 return argv
             out[index + 1] = rewritten_filter
+            rewritten_filter_index = index
             rewrite_kind = "SUBTITLE_FILTER_COMPLEX" if use_filter_complex else "HARDWARE_FILTER"
             report["hdr_to_hdr"].append(f"{rewrite_kind}_REWRITE: {message}")
             changed_filter = True
@@ -1293,6 +1417,27 @@ def rewrite_intel_qsv_hdr_to_hdr(argv, report, use_filter_complex=False):
     if not changed_filter:
         report["hdr_to_hdr"].append("BAIL: VAAPI/QSV filter was not found during rewrite")
         return argv
+
+    if ENABLE_DIAGNOSTIC_OVERLAY == 1 and not use_filter_complex:
+        if diagnostic_overlay_filters_available():
+            out, diagnostic_message = promote_qsv_filter_to_opencl_diagnostic(
+                out,
+                rewritten_filter_index,
+                out[rewritten_filter_index + 1],
+                "SUCCESS: HDR_TO_HDR_REWRITE_APPLIED (VAAPI/QSV)",
+                source_decision,
+            )
+            if out == argv or diagnostic_message.startswith("BAIL:"):
+                report["hdr_to_hdr"].append(diagnostic_message)
+                return argv
+            report["hdr_to_hdr"].append(
+                "DIAGNOSTIC_OVERLAY_ENABLED: " + diagnostic_message
+            )
+        else:
+            report["hdr_to_hdr"].append(
+                "DIAGNOSTIC_OVERLAY_UNAVAILABLE: requires OpenCL compositor, "
+                "drawtext, and color filters"
+            )
 
     out, actions = set_or_add_option(out, ["-profile:v:0", "-profile:v"], "main10")
     report["hdr_to_hdr"].extend(actions)
@@ -1311,9 +1456,10 @@ def rewrite_intel_qsv_hdr_to_hdr(argv, report, use_filter_complex=False):
     return out
 
 
-def rewrite_opencl_dovi_to_hdr10(argv, report):
+def rewrite_opencl_dovi_to_hdr10(argv, report, source_decision):
     out = argv[:]
     changed_filter = False
+    rewritten_filter_index = None
     pattern = re.compile(r"tonemap_opencl=[^,;\[\]]+")
 
     for index in range(len(out) - 1):
@@ -1332,6 +1478,7 @@ def rewrite_opencl_dovi_to_hdr10(argv, report):
         if count != 1:
             continue
         out[index + 1] = rewritten
+        rewritten_filter_index = index
         changed_filter = True
         report["hdr_to_hdr"].append(
             "DOVI_FILTER_REWRITE: changed OpenCL SDR tone mapping to all-GPU "
@@ -1344,6 +1491,29 @@ def rewrite_opencl_dovi_to_hdr10(argv, report):
             "BAIL: recognized Profile 5 conversion but OpenCL filter shape was not safely matched"
         )
         return argv
+
+    if ENABLE_DIAGNOSTIC_OVERLAY == 1:
+        if diagnostic_overlay_filters_available():
+            out, diagnostic_message = promote_qsv_filter_to_opencl_diagnostic(
+                out,
+                rewritten_filter_index,
+                out[rewritten_filter_index + 1],
+                "SUCCESS: DOVI_PROFILE5_TO_HDR10_REWRITE_APPLIED "
+                "(VAAPI/OpenCL/QSV)",
+                source_decision,
+                dovi=True,
+            )
+            if out == argv or diagnostic_message.startswith("BAIL:"):
+                report["hdr_to_hdr"].append(diagnostic_message)
+                return argv
+            report["hdr_to_hdr"].append(
+                "DIAGNOSTIC_OVERLAY_ENABLED: " + diagnostic_message
+            )
+        else:
+            report["hdr_to_hdr"].append(
+                "DIAGNOSTIC_OVERLAY_UNAVAILABLE: requires OpenCL compositor, "
+                "drawtext, and color filters"
+            )
 
     out, actions = set_or_add_option(out, ["-profile:v:0", "-profile:v"], "main10")
     report["hdr_to_hdr"].extend(actions)
@@ -1375,7 +1545,7 @@ def rewrite_intel_qsv_backend(
                 "BAIL: Intel QSV Profile 5 conversion requires the recognized OpenCL-to-QSV graph"
             )
             return argv
-        return rewrite_opencl_dovi_to_hdr10(argv, report)
+        return rewrite_opencl_dovi_to_hdr10(argv, report, source_decision)
 
     if variant == "vaapi_qsv_subtitle_overlay":
         if ENABLE_FILTER_COMPLEX_HDR_TO_HDR != 1:
@@ -1384,10 +1554,12 @@ def rewrite_intel_qsv_backend(
                 "ENABLE_FILTER_COMPLEX_HDR_TO_HDR=0"
             )
             return argv
-        return rewrite_intel_qsv_hdr_to_hdr(argv, report, use_filter_complex=True)
+        return rewrite_intel_qsv_hdr_to_hdr(
+            argv, report, source_decision, use_filter_complex=True
+        )
 
     if variant == "vaapi_qsv_hdr10":
-        return rewrite_intel_qsv_hdr_to_hdr(argv, report)
+        return rewrite_intel_qsv_hdr_to_hdr(argv, report, source_decision)
 
     report["hdr_to_hdr"].append(
         "BAIL: Intel QSV command does not match a supported rewrite graph"
@@ -1515,6 +1687,21 @@ def rewrite_hdr_to_hdr(argv, report, client_decision, source_decision):
 
             if is_hdr_to_sdr_filter(original_filter):
                 out[i + 1], replacement_msg = replace_tonemapx_with_hdr_to_hdr(original_filter)
+                if (
+                    ENABLE_DIAGNOSTIC_OVERLAY == 1
+                    and ffmpeg_supports_filter("drawtext")
+                ):
+                    out[i + 1] += "," + diagnostic_drawtext_chain(
+                        "SUCCESS: HDR_TO_HDR_REWRITE_APPLIED (LIBX265)"
+                    )
+                    replacement_msg += " with diagnostic burn-in"
+                    report["hdr_to_hdr"].append(
+                        "DIAGNOSTIC_OVERLAY_ENABLED: drawing on software P010 frames"
+                    )
+                elif ENABLE_DIAGNOSTIC_OVERLAY == 1:
+                    report["hdr_to_hdr"].append(
+                        "DIAGNOSTIC_OVERLAY_UNAVAILABLE: drawtext filter is missing"
+                    )
                 report["hdr_to_hdr"].append(f"FILTER_REWRITE: {out[i]} {replacement_msg}")
                 changed_filter = True
 

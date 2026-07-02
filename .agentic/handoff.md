@@ -1093,17 +1093,27 @@ separate backend.  Software encoders remain the universal fallback.
 
 ### Optional in-video diagnostic overlay
 
-`shim.enable_diagnostic_overlay` is disabled by default.  On a recognized
-OpenCL subtitle rewrite, enabling it adds a temporary status panel for
-`tuning.diagnostic_overlay_duration_seconds` (five seconds in the example).
+`shim.enable_diagnostic_overlay` is disabled by default.  On any recognized
+HDR rewrite, enabling it adds a temporary status panel for
+`tuning.diagnostic_overlay_duration_seconds` (15 seconds in the example).
 The configured jellyfin-ffmpeg must advertise `drawtext`, `color`, and
-`overlay_p010_bgra_opencl`.
+`overlay_p010_bgra_opencl` for accelerated hardware panels.  The software
+libx265 path requires only `drawtext`.
 
-The panel is a shallow BGRA `color` source rendered with `drawtext`, uploaded
-to OpenCL, and blended by a second `overlay_p010_bgra_opencl` invocation.  The
-first invocation burns the actual subtitles and leaves its output in OpenCL;
-the second adds the diagnostic panel before the existing OpenCL-to-VAAPI-to-QSV
-return mapping.  The P010 main frame is never downloaded.  The panel reports:
+The hardware panel is a shallow BGRA `color` source rendered with `drawtext`,
+uploaded to OpenCL, and blended with `overlay_p010_bgra_opencl`.  Ordinary
+VAAPI/QSV and Profile 5 simple filter graphs are promoted to `-filter_complex`:
+the selected video map feeds the rewritten P010 main branch, the panel is a
+second branch, and `[diagnostic_out]` replaces the original video map.  The
+main branch remains in OpenCL until composition, then maps through explicit
+VAAPI back to QSV.  The P010 frame is never downloaded.
+
+For subtitle burn-in, the first compositor invocation burns the subtitles and
+leaves its output in OpenCL; a second invocation adds the diagnostic panel
+before the existing OpenCL-to-VAAPI-to-QSV return mapping.  Software libx265
+uses `drawtext` directly because no hardware-frame transition is involved.
+The panel reports a path-specific success line plus compositor and output
+details, for example:
 
 ```text
 SUCCESS: HDR_TO_HDR_REWRITE_APPLIED (VAAPI/QSV SUBTITLE OVERLAY)
@@ -1111,9 +1121,13 @@ COMPOSITOR: OpenCL P010/BGRA
 OUTPUT: HEVC Main10 / BT.2020 / PQ
 ```
 
-The feature deliberately does not run on the software compositor or on other
-HDR rewrite shapes.  If any required filter is absent, the media rewrite
-continues without the panel and records `DIAGNOSTIC_OVERLAY_UNAVAILABLE`.
+The first line changes to `HDR_TO_HDR_REWRITE_APPLIED (VAAPI/QSV)`,
+`DOVI_PROFILE5_TO_HDR10_REWRITE_APPLIED (VAAPI/OpenCL/QSV)`, or
+`HDR_TO_HDR_REWRITE_APPLIED (LIBX265)` for the other supported paths.
+
+Unsupported rewrite shapes still pass through unchanged.  If any required
+diagnostic filter is absent, the HDR media rewrite continues without the panel
+and records `DIAGNOSTIC_OVERLAY_UNAVAILABLE`.
 
 ### Acceptance requirements for every new backend
 
