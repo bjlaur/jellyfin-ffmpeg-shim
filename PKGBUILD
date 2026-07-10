@@ -1,6 +1,6 @@
 pkgname=jellyfin-ffmpeg-shim
 pkgver=0.1.0
-pkgrel=1
+pkgrel=2
 pkgdesc='Jellyfin FFmpeg shim for selective HDR-to-HDR transcoding'
 arch=('any')
 url='https://github.com/bjlaur/jellyfin-ffmpeg-shim'
@@ -24,6 +24,8 @@ sha256sums=(
 package() {
   install -Dm755 jellyfin-ffmpeg-shim \
     "$pkgdir/usr/local/bin/jellyfin-ffmpeg-shim"
+  ln -s /usr/lib/jellyfin-ffmpeg/ffprobe \
+    "$pkgdir/usr/local/bin/ffprobe"
   install -Dm640 shim.json.example \
     "$pkgdir/etc/jellyfin/shim.json"
   install -Dm644 README.md \

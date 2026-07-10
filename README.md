@@ -138,6 +138,7 @@ The package installs:
 
 ```text
 /usr/local/bin/jellyfin-ffmpeg-shim
+/usr/local/bin/ffprobe -> /usr/lib/jellyfin-ffmpeg/ffprobe
 /etc/jellyfin/shim.json
 ```
 
